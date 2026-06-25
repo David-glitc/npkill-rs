@@ -84,7 +84,7 @@ impl From<CliArgs> for ScanConfig {
             exclude_sensitive: args.exclude_sensitive,
             delete_all: args.delete_all,
             yes: args.yes,
-            max_depth: args.max_depth,
+            max_depth: args.max_depth.or(Some(5)),
         }
     }
 }

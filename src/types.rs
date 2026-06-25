@@ -120,7 +120,7 @@ impl Default for ScanConfig {
             exclude_sensitive: false,
             delete_all: false,
             yes: false,
-            max_depth: None,
+            max_depth: Some(5),
         }
     }
 }
