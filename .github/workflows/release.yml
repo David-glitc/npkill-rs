@@ -56,7 +56,7 @@ jobs:
 
           # Windows
           cd target/x86_64-pc-windows-gnu/release
-          7z a -tzip ../../../release_assets/${{ env.BIN_NAME }}-x86_64-pc-windows-gnu.zip ${{ env.BIN_NAME }}.exe
+          zip ../../../release_assets/${{ env.BIN_NAME }}-x86_64-pc-windows-gnu.zip ${{ env.BIN_NAME }}.exe
           cd ../../..
 
           cd release_assets
