@@ -9,76 +9,56 @@ env:
   BIN_NAME: npkill-rs
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            ext: tar.gz
-            pack: tar czf
-            cross: false
-          - target: aarch64-unknown-linux-gnu
-            ext: tar.gz
-            pack: tar czf
-            cross: true
-          - target: x86_64-pc-windows-gnu
-            ext: zip
-            pack: 7z a -tzip
-            cross: true
-    runs-on: [self-hosted, clems-machine]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          target: ${{ matrix.target }}
-      - name: Install cross-compiler (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Install cross-compiler (Windows)
-        if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
-      - name: Set env for aarch64 cross-compile
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-      - name: Set env for Windows cross-compile
-        if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: echo "CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Package binary (Unix)
-        if: matrix.ext == 'tar.gz'
-        run: |
-          cd target/${{ matrix.target }}/release
-          ${{ matrix.pack }} ../../../${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.ext }} ${{ env.BIN_NAME }}
-      - name: Package binary (Windows)
-        if: matrix.ext == 'zip'
-        run: |
-          cd target/${{ matrix.target }}/release
-          ${{ matrix.pack }} ../../../${{ env.BIN_NAME }}-${{ matrix.target }}.zip ${{ env.BIN_NAME }}.exe
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.target }}
-          path: ${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.ext }}
-
   release:
-    name: Publish Release
-    needs: build
+    name: Build & Publish
     runs-on: [self-hosted, clems-machine]
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-      - name: Collect artifacts and checksums
+      - uses: actions/checkout@v4
+
+      - name: Install cross-compilers
         run: |
-          mkdir release_assets
-          find artifacts -name "*.tar.gz" -o -name "*.zip" -exec cp {} release_assets/ \;
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu mingw-w64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-unknown-linux-gnu,
+            aarch64-unknown-linux-gnu,
+            x86_64-pc-windows-gnu
+
+      - name: Build all targets
+        run: |
+          mkdir -p release_assets
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu; do
+            echo "=== Building $target ==="
+            cargo build --release --target "$target" &
+          done
+          wait
+          echo "=== All builds complete ==="
+
+      - name: Package binaries
+        run: |
+          # x86_64 Linux
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf ../../../release_assets/${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu.tar.gz ${{ env.BIN_NAME }}
+          cd ../../..
+
+          # aarch64 Linux
+          cd target/aarch64-unknown-linux-gnu/release
+          tar czf ../../../release_assets/${{ env.BIN_NAME }}-aarch64-unknown-linux-gnu.tar.gz ${{ env.BIN_NAME }}
+          cd ../../..
+
+          # Windows
+          cd target/x86_64-pc-windows-gnu/release
+          7z a -tzip ../../../release_assets/${{ env.BIN_NAME }}-x86_64-pc-windows-gnu.zip ${{ env.BIN_NAME }}.exe
+          cd ../../..
+
           cd release_assets
           sha256sum * > sha256sums.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
