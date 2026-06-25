@@ -32,11 +32,17 @@ This downloads the latest binary for your platform, installs it to `~/.local/bin
 
 ### Quick (pre-built binary)
 
+**Linux / macOS:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.sh | bash
 ```
 
-Supports Linux (x86_64, aarch64) and macOS (x86_64, arm64).
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.ps1 | iex
+```
+
+Supports Linux (x86_64, aarch64) and Windows (x86_64).
 
 ### From source
 

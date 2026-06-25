@@ -17,8 +17,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            ext: tar.gz
+            pack: tar czf
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            ext: tar.gz
+            pack: tar czf
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: zip
+            pack: 7z a -tzip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -27,15 +35,22 @@ jobs:
           target: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Package binary
+      - name: Package binary (Unix)
+        if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ env.BIN_NAME }}-${{ matrix.target }}.tar.gz ${{ env.BIN_NAME }}
+          ${{ matrix.pack }} ../../../${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.ext }} ${{ env.BIN_NAME }}
+      - name: Package binary (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a -tzip ../../../${{ env.BIN_NAME }}-${{ matrix.target }}.zip ${{ env.BIN_NAME }}.exe
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: ${{ env.BIN_NAME }}-${{ matrix.target }}.tar.gz
+          path: ${{ env.BIN_NAME }}-${{ matrix.target }}.${{ matrix.ext }}
 
   release:
     name: Publish Release
@@ -50,9 +65,9 @@ jobs:
       - name: Collect artifacts and checksums
         run: |
           mkdir release_assets
-          find artifacts -name "*.tar.gz" -exec cp {} release_assets/ \;
+          find artifacts -name "*.tar.gz" -o -name "*.zip" -exec cp {} release_assets/ \;
           cd release_assets
-          sha256sum *.tar.gz > sha256sums.txt
+          sha256sum * > sha256sums.txt
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
