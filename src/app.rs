@@ -41,7 +41,7 @@ pub struct App {
     pub frame_count: u64,
     pub delete_animations: Vec<DeleteAnimation>,
     pub total_dirs_visited: u64,
-    pub eta_seconds: Option<f64>,
+    pub total_dirs_estimate: u64,
     pub scan_progress: f64,
     pub scan_complete: bool,
     pub current_scan_path: String,
@@ -50,6 +50,9 @@ pub struct App {
     /// True when a popup (settings/help) is open over the scan tab.
     pub popup_open: bool,
     pub update_available: Option<String>,
+    pub delete_start: Option<Instant>,
+    pub pending_delete_count: usize,
+    pub delete_eta_seconds: Option<f64>,
 }
 
 impl App {
@@ -72,7 +75,7 @@ impl App {
             frame_count: 0,
             delete_animations: Vec::new(),
             total_dirs_visited: 0,
-            eta_seconds: None,
+            total_dirs_estimate: 0,
             scan_progress: 0.0,
             scan_complete: false,
             current_scan_path: String::new(),
@@ -80,6 +83,9 @@ impl App {
             settings_cursor: 0,
             popup_open: false,
             update_available: None,
+            delete_start: None,
+            pending_delete_count: 0,
+            delete_eta_seconds: None,
         }
     }
 
@@ -219,6 +225,7 @@ impl App {
                         started_at: Instant::now(),
                         phase: DeletePhase::Deleting,
                     });
+                    self.update_delete_eta();
                 }
                 DeleteResult::Failed => {
                     folder.status = FolderStatus::Error;
@@ -253,6 +260,7 @@ impl App {
                     if let Some(s) = folder.size {
                         self.stats.total_size_freed += s;
                     }
+                    self.update_delete_eta();
                 }
                 DeleteResult::Failed => {
                     folder.status = FolderStatus::Error;
@@ -324,6 +332,21 @@ impl App {
         }
     }
 
+    fn update_delete_eta(&mut self) {
+        let now = Instant::now();
+        if self.delete_start.is_none() {
+            self.delete_start = Some(now);
+        }
+        let elapsed = self.delete_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.01).max(0.01);
+        let rate = self.stats.total_deleted as f64 / elapsed;
+        let remaining = self.pending_delete_count.saturating_sub(self.stats.total_deleted);
+        self.delete_eta_seconds = if rate > 0.0 && remaining > 0 {
+            Some(remaining as f64 / rate)
+        } else {
+            None
+        };
+    }
+
     fn delete_progress(&self, real_idx: usize) -> f64 {
         for anim in &self.delete_animations {
             if anim.folder_index == real_idx {
@@ -376,6 +399,7 @@ fn run(
             if let Ok(mut p) = progress.lock() {
                 a.current_scan_path = p.current_path.clone();
                 a.total_dirs_visited = p.dirs_visited;
+                a.total_dirs_estimate = p.total_dirs_estimate;
                 a.stats.total_found = a.stats.total_found.max(p.folders_found);
                 a.stats.total_size_reclaimable =
                     a.stats.total_size_reclaimable.max(p.total_size_reclaimable);
@@ -391,15 +415,14 @@ fn run(
                     a.apply_sort();
                 }
 
-                if !a.scan_complete && p.dirs_visited > 0 {
-                    let elapsed = a.scan_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(1.0).max(0.01);
-                    let rate = p.dirs_visited as f64 / elapsed;
-                    if rate > 0.0 {
-                        let remaining_dirs = (p.dirs_visited as f64 * 2.0).max(1000.0);
-                        let eta_secs = (remaining_dirs - p.dirs_visited as f64) / rate;
-                        a.eta_seconds = Some(eta_secs.max(0.0));
-                    }
-                    a.scan_progress = (p.dirs_visited as f64 * 0.02).min(0.99);
+                // Count pending deletions for ETA
+                if a.scan_complete {
+                    a.pending_delete_count = a.folders.iter().filter(|f| f.status == FolderStatus::Pending).count();
+                }
+
+                if !a.scan_complete {
+                    let total = p.total_dirs_estimate.max(1);
+                    a.scan_progress = (p.dirs_visited as f64 / total as f64).min(0.99);
                 }
             }
         }
@@ -474,16 +497,10 @@ fn run(
                     .unwrap_or(Instant::now());
             }
 
-            if let Event::Mouse(mouse) = event::read()? {
+                if let Event::Mouse(mouse) = event::read()? {
                 let mut a = app.lock().unwrap();
                 if a.popup_open {
-                    // Click outside popup closes it
-                    if let MouseEventKind::Down(_) = mouse.kind {
-                        // Only close if we have a way to determine "outside"
-                        // For now: any mouse click closes the popup
-                        a.popup_open = false;
-                        a.active_tab = Tab::Scan;
-                    }
+                    // Modal: all mouse events are swallowed while popup is open
                 } else if a.active_tab == Tab::Scan {
                     match mouse.kind {
                         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -751,20 +768,42 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
     } else {
         time_elapsed
     };
-    let stats2 = Line::from(vec![
-        Span::styled(" Reclaimable: ", Style::default().fg(p.dim)),
-        Span::styled(&reclaimable_str, Style::default().fg(p.warning).add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::styled("│", Style::default().fg(p.surface)),
-        Span::raw("  "),
-        Span::styled("Elapsed: ", Style::default().fg(p.dim)),
-        Span::styled(time_str, Style::default().fg(p.accent)),
-        Span::raw("  "),
-        Span::styled("│", Style::default().fg(p.surface)),
-        Span::raw("  "),
-        Span::styled("Freed: ", Style::default().fg(p.dim)),
-        Span::styled(&freed_str, Style::default().fg(p.success)),
-    ]);
+    let delete_eta_str = app
+        .delete_eta_seconds
+        .filter(|&e| e > 0.0 && e.is_finite())
+        .map(App::format_duration)
+        .unwrap_or_default();
+    let stats2 = if !delete_eta_str.is_empty() {
+        Line::from(vec![
+            Span::styled(" Reclaimable: ", Style::default().fg(p.dim)),
+            Span::styled(&reclaimable_str, Style::default().fg(p.warning).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled("│", Style::default().fg(p.surface)),
+            Span::raw("  "),
+            Span::styled("Delete ETA: ", Style::default().fg(p.dim)),
+            Span::styled(&delete_eta_str, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled("│", Style::default().fg(p.surface)),
+            Span::raw("  "),
+            Span::styled("Freed: ", Style::default().fg(p.dim)),
+            Span::styled(&freed_str, Style::default().fg(p.success)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Reclaimable: ", Style::default().fg(p.dim)),
+            Span::styled(&reclaimable_str, Style::default().fg(p.warning).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled("│", Style::default().fg(p.surface)),
+            Span::raw("  "),
+            Span::styled("Elapsed: ", Style::default().fg(p.dim)),
+            Span::styled(time_str, Style::default().fg(p.accent)),
+            Span::raw("  "),
+            Span::styled("│", Style::default().fg(p.surface)),
+            Span::raw("  "),
+            Span::styled("Freed: ", Style::default().fg(p.dim)),
+            Span::styled(&freed_str, Style::default().fg(p.success)),
+        ])
+    };
     frame.render_widget(Paragraph::new(stats2), chunks[2]);
 
     let scan_path = if !app.current_scan_path.is_empty() {
@@ -789,20 +828,9 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
     if !app.scan_complete {
         let spinner = app.spinner_char();
         let dirs = app.total_dirs_visited;
-        let found = app.stats.total_found;
         let elapsed = app.scan_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
         let elapsed_str = App::format_duration(elapsed);
-        let eta_str = app
-            .eta_seconds
-            .filter(|&e| e > 0.0 && e.is_finite())
-            .map(App::format_duration)
-            .unwrap_or_default();
-        let eta_display = if !eta_str.is_empty() {
-            format!(" ETA {}", eta_str)
-        } else {
-            String::new()
-        };
-        let progress_str = format!(" {}  {} elapsed{}  dirs: {}  found: {}", spinner, elapsed_str, eta_display, dirs, found);
+        let progress_str = format!(" {}  {} elapsed  {}/{} dirs  found: {}", spinner, elapsed_str, dirs, app.total_dirs_estimate.max(dirs), app.folders.len());
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(&progress_str, Style::default().fg(p.accent)))),
             chunks[4],

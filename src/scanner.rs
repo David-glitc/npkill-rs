@@ -49,6 +49,9 @@ impl Scanner {
             return Vec::new();
         }
 
+        // ── Telescope: count total dirs upfront for accurate progress ──
+        self.telescope_dir_count();
+
         // ── Phase 1: walk the tree, find targets (skip their contents) ──
         let mut results = self.walk_for_targets();
 
@@ -58,6 +61,31 @@ impl Scanner {
         }
 
         results
+    }
+
+    /// Quick upfront count of all directories under root_path.
+    fn telescope_dir_count(&self) {
+        let mut count: u64 = 0;
+        let mut dirs = vec![self.config.root_path.clone()];
+        while let Some(dir) = dirs.pop() {
+            count += 1;
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Ok(ft) = entry.file_type() {
+                        if ft.is_dir() {
+                            let path = entry.path();
+                            if self.is_allowed(&path) {
+                                dirs.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref p) = self.progress {
+            let mut prog = p.lock().unwrap();
+            prog.total_dirs_estimate = count;
+        }
     }
 
     /// Phase 1: walk directory tree, identify target dirs, skip walking into them.

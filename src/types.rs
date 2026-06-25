@@ -11,6 +11,8 @@ pub struct ScanProgress {
     pub current_path: String,
     /// Incrementally discovered folders — TUI drains these each frame.
     pub pending_folders: Vec<FoundFolder>,
+    /// Total directory count from upfront telescope pass (0 = unknown).
+    pub total_dirs_estimate: u64,
 }
 
 impl ScanProgress {
@@ -21,6 +23,7 @@ impl ScanProgress {
             dirs_visited: 0,
             current_path: String::new(),
             pending_folders: Vec::new(),
+            total_dirs_estimate: 0,
         }))
     }
 }
