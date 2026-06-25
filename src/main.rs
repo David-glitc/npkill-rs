@@ -272,15 +272,27 @@ fn main() -> anyhow::Result<()> {
     let app_clone = app.clone();
     let prog_clone = progress.clone();
     let scan_handle = std::thread::spawn(move || {
-        let results = scanner.scan();
+        // Phase 1: find targets (fast, ~1s) — show results immediately
+        let mut results = scanner.scan_phase1();
         let mut a = app_clone.lock().unwrap();
-        a.process_scan_results(results);
+        a.process_scan_results(results.clone());
+        drop(a);
+
+        // Phase 2: compute sizes (fast with du, ~50ms)
+        scanner.compute_stats(&mut results);
+        let mut a = app_clone.lock().unwrap();
+        a.stats.total_size_reclaimable = results.iter().filter_map(|f| f.size).sum();
+        // Update individual folder sizes in place
+        for folder in &results {
+            if let Some(idx) = a.folders.iter().position(|f| f.path == folder.path) {
+                a.folders[idx].size = folder.size;
+                a.folders[idx].last_modified = folder.last_modified;
+            }
+        }
         // Final sync of incremental progress
         let p = prog_clone.lock().unwrap();
         a.current_scan_path = p.current_path.clone();
         a.stats.total_found = a.stats.total_found.max(p.folders_found);
-        a.stats.total_size_reclaimable =
-            a.stats.total_size_reclaimable.max(p.total_size_reclaimable);
     });
 
     let tui_result = npkill_rs::app::run_tui(&mut app, progress);

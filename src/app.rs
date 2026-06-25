@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -49,6 +50,10 @@ pub struct App {
     pub settings_cursor: usize,
     /// True when a popup (settings/help) is open over the scan tab.
     pub popup_open: bool,
+    /// Real indices of folders toggled with Space (checkbox selection).
+    pub checked_indices: HashSet<usize>,
+    /// True when batch-delete confirmation popup is shown.
+    pub batch_confirm: bool,
     pub update_available: Option<String>,
     pub delete_start: Option<Instant>,
     pub pending_delete_count: usize,
@@ -82,6 +87,8 @@ impl App {
             theme: Theme::Catppuccino,
             settings_cursor: 0,
             popup_open: false,
+            checked_indices: HashSet::new(),
+            batch_confirm: false,
             update_available: None,
             delete_start: None,
             pending_delete_count: 0,
@@ -233,6 +240,52 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn toggle_checkbox(&mut self) {
+        if let Some(real_i) = self.selected_real_index() {
+            if self.checked_indices.contains(&real_i) {
+                self.checked_indices.remove(&real_i);
+            } else {
+                self.checked_indices.insert(real_i);
+            }
+        }
+    }
+
+    pub fn delete_checked_folders(&mut self) {
+        let dry = self.config.dry_run;
+        let indices: Vec<usize> = self.checked_indices.iter().copied().collect();
+        for real_i in indices {
+            if real_i >= self.folders.len() {
+                continue;
+            }
+            let folder = &mut self.folders[real_i];
+            if folder.status == FolderStatus::Deleted || folder.status == FolderStatus::Deleting {
+                continue;
+            }
+            folder.status = FolderStatus::Deleting;
+            let result = deleter::delete_folder(folder, dry);
+            match result {
+                DeleteResult::Success | DeleteResult::DryRun => {
+                    folder.status = FolderStatus::Deleted;
+                    self.stats.total_deleted += 1;
+                    if let Some(s) = folder.size {
+                        self.stats.total_size_freed += s;
+                    }
+                    self.delete_animations.push(DeleteAnimation {
+                        folder_index: real_i,
+                        started_at: Instant::now(),
+                        phase: DeletePhase::Deleting,
+                    });
+                    self.update_delete_eta();
+                }
+                DeleteResult::Failed => {
+                    folder.status = FolderStatus::Error;
+                    self.stats.total_errors += 1;
+                }
+            }
+        }
+        self.checked_indices.clear();
     }
 
     pub fn delete_all_folders(&mut self) {
@@ -444,6 +497,7 @@ fn run(
                     KeyCode::Esc => {
                         if a.popup_open {
                             a.popup_open = false;
+                            a.batch_confirm = false;
                             a.active_tab = Tab::Scan;
                             continue;
                         }
@@ -483,13 +537,17 @@ fn run(
                 }
 
                 if a.popup_open {
-                    match a.active_tab {
-                        Tab::Settings => handle_settings_key(&mut a, key.code),
-                        Tab::Help => {}
-                        _ => {}
+                    if a.batch_confirm {
+                        handle_batch_confirm_key(&mut a, key.code);
+                    } else {
+                        match a.active_tab {
+                            Tab::Settings => handle_settings_key(&mut a, key.code),
+                            Tab::Help => {}
+                            _ => {}
+                        }
                     }
                 } else if a.active_tab == Tab::Scan {
-                    handle_scan_key(&mut a, key.code);
+                    handle_scan_key(&mut a, key);
                 }
 
                 last_render = Instant::now()
@@ -541,7 +599,10 @@ fn run(
     Ok(())
 }
 
-fn handle_scan_key(a: &mut App, code: KeyCode) {
+fn handle_scan_key(a: &mut App, key: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyModifiers;
+    let code = key.code;
+
     if a.search_mode {
         match code {
             KeyCode::Esc | KeyCode::Enter => a.search_mode = false,
@@ -556,6 +617,15 @@ fn handle_scan_key(a: &mut App, code: KeyCode) {
                 a.set_search_query(q);
             }
             _ => {}
+        }
+        return;
+    }
+
+    // Ctrl+D batch delete
+    if code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if !a.checked_indices.is_empty() {
+            a.batch_confirm = true;
+            a.popup_open = true;
         }
         return;
     }
@@ -577,7 +647,8 @@ fn handle_scan_key(a: &mut App, code: KeyCode) {
                 a.list_selected = Some(len - 1);
             }
         }
-        KeyCode::Enter | KeyCode::Char(' ') => a.delete_selected(),
+        KeyCode::Enter => a.delete_selected(),
+        KeyCode::Char(' ') => a.toggle_checkbox(),
         KeyCode::Char('d') => {
             if a.config.delete_all {
                 a.delete_all_folders();
@@ -595,7 +666,7 @@ fn handle_scan_key(a: &mut App, code: KeyCode) {
 }
 
 fn handle_settings_key(a: &mut App, code: KeyCode) {
-    let settings_len = 6;
+    let settings_len = 7;
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
             a.settings_cursor = (a.settings_cursor + 1).min(settings_len - 1);
@@ -620,8 +691,30 @@ fn handle_settings_key(a: &mut App, code: KeyCode) {
                     SortField::Path => SortField::Size,
                 }
             }
+            6 => {
+                let depths = [Some(2), Some(3), Some(5), Some(10), None];
+                let idx = depths.iter().position(|d| *d == a.config.max_depth).unwrap_or(2);
+                a.config.max_depth = depths[(idx + 1) % depths.len()];
+            }
             _ => {}
         },
+        _ => {}
+    }
+}
+
+fn handle_batch_confirm_key(a: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+            a.batch_confirm = false;
+            a.popup_open = false;
+            a.active_tab = Tab::Scan;
+            a.delete_checked_folders();
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            a.batch_confirm = false;
+            a.popup_open = false;
+            a.active_tab = Tab::Scan;
+        }
         _ => {}
     }
 }
@@ -916,11 +1009,10 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
                 crate::types::TargetKind::NodeModules => "NM",
                 crate::types::TargetKind::NextDotNext => "NX",
             };
-            let sc = match f.status {
-                FolderStatus::Pending => " ",
-                FolderStatus::Deleting => ">",
-                FolderStatus::Deleted => "D",
-                FolderStatus::Error => "E",
+            let cb = if app.checked_indices.contains(&ri) {
+                "x"
+            } else {
+                " "
             };
             let rm = if f.risk == RiskLevel::Sensitive {
                 "!"
@@ -957,7 +1049,7 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
                 let age = f.last_modified.map_or_else(String::new, |ts| {
                     format!(" {:>3}d", (now_secs - ts) / 86400)
                 });
-                let line = format!(" {sc} [{tag}]{rm}  {sz:>8}{age}  {}", f.path.display());
+                let line = format!(" [{cb}] [{tag}]{rm}  {sz:>8}{age}  {}", f.path.display());
                 let is_even = display_i % 2 == 0;
                 let row_bg = if is_even { p.bg } else { p.surface };
                 let st = match f.status {
@@ -995,7 +1087,7 @@ fn progress_bar(progress: f64, width: usize) -> String {
 
 fn draw_column_headers(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let sort_field = app.sort_field;
-    let col_status = Span::styled(" S  ", Style::default().fg(p.dim));
+    let col_cb = Span::styled("[ ]", Style::default().fg(p.dim));
     let col_tag = Span::styled("[Tag]", Style::default().fg(p.dim));
 
     let (size_style, date_style, path_style) = match sort_field {
@@ -1017,7 +1109,8 @@ fn draw_column_headers(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalett
     };
 
     let header = Line::from(vec![
-        col_status,
+        col_cb,
+        Span::raw(" "),
         col_tag,
         Span::raw(" "),
         Span::styled("Size", size_style),
@@ -1041,6 +1134,11 @@ fn draw_column_headers(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalett
 fn draw_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     // Dimmed backdrop
     frame.render_widget(Clear, area);
+
+    if app.batch_confirm {
+        draw_batch_confirm_popup(frame, area, app, p);
+        return;
+    }
 
     let popup_width = area.width.clamp(40, 60);
     let popup_height = match app.active_tab {
@@ -1077,6 +1175,7 @@ fn draw_settings_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalett
         format!("Disable size: {}", if app.config.disable_size { "ON" } else { "off" }),
         format!("Disable age: {}", if app.config.disable_age { "ON" } else { "off" }),
         format!("Sort: {} {}", app.sort_indicator(), match app.sort_direction { SortDirection::Asc => "↑", SortDirection::Desc => "↓" }),
+        format!("Max depth: {}", app.config.max_depth.map_or("∞".to_string(), |d| d.to_string())),
     ]
     .into_iter()
     .enumerate()
@@ -1118,8 +1217,10 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
         Line::from(Span::raw("  Home/g End/G  First / last")),
         Line::from(Span::raw("")),
         Line::from(Span::styled(" Actions", Style::default().fg(p.success))),
-        Line::from(Span::raw("  Enter/Space  Delete selected")),
-        Line::from(Span::raw("  d            Delete all (--delete-all)")),
+        Line::from(Span::raw("  Enter         Delete selected")),
+        Line::from(Span::raw("  Space         Toggle checkbox")),
+        Line::from(Span::raw("  Ctrl+d        Delete checked folders")),
+        Line::from(Span::raw("  d             Delete all (--delete-all)")),
         Line::from(Span::raw("")),
         Line::from(Span::styled(" Sort & Search", Style::default().fg(p.success))),
         Line::from(Span::raw("  s            Cycle sort        S  Reverse sort")),
@@ -1160,18 +1261,58 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     frame.render_widget(hint, hint_area);
 }
 
+fn draw_batch_confirm_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+    let n = app.checked_indices.len();
+    let lines = vec![
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(
+            format!(" Delete {} selected folder(s)? ", n),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw("")),
+        Line::from(Span::raw("")),
+        Line::from(Span::styled(" y / Enter  Confirm", Style::default().fg(p.success))),
+        Line::from(Span::styled(" n / Esc    Cancel", Style::default().fg(p.error))),
+    ];
+
+    let popup_width = area.width.clamp(32, 48);
+    let popup_height = 9;
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Confirm Delete ")
+        .title_alignment(Alignment::Left)
+        .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg));
+    let inner = block.inner(popup_area);
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(p.bg)),
+        inner,
+    );
+}
+
 // ── Status bar ───────────────────────────────────────────────
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let left = if app.popup_open {
-        match app.active_tab {
-            Tab::Settings => " ↑/j ↓/k  Enter toggle  Esc close",
-            Tab::Help => " Esc close",
-            _ => " Esc close",
+        if app.batch_confirm {
+            " y confirm  n/Esc cancel"
+        } else {
+            match app.active_tab {
+                Tab::Settings => " ↑/j ↓/k  Enter toggle  Esc close",
+                Tab::Help => " Esc close",
+                _ => " Esc close",
+            }
         }
     } else {
         match app.active_tab {
-            Tab::Scan => " ↑↓/j/k nav  Enter del  / search  s sort  2 settings  3 help  q quit",
+            Tab::Scan => " ↑↓/j/k nav  Enter del  Space sel  ^D batch-del  / search  s sort  2 settings  3 help  q quit",
             _ => " Esc back",
         }
     };
@@ -1196,6 +1337,13 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
             " SCANNING ",
             Style::default().fg(p.bg).bg(p.accent).add_modifier(Modifier::BOLD),
         ));
+        if !app.current_scan_path.is_empty() {
+            right_parts.push(Span::raw(" "));
+            right_parts.push(Span::styled(
+                &app.current_scan_path,
+                Style::default().fg(p.dim),
+            ));
+        }
     }
     if let Some(ref ver) = app.update_available {
         right_parts.push(Span::styled(

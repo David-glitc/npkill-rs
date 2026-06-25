@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.5.0] - 2026-06-25
+
+### Added
+- **Hidden directory skip** (default): `.cache`, `.config`, `.npm`, `.yarn`, `.local` etc. skipped — Phase 1 ~700ms vs 136s before on `/home`
+- **`--include-hidden`** flag to opt out (scan hidden dirs as well)
+- **Checkbox selection**: `Space` toggles checkbox on selected folder, `Ctrl+D` batch-deletes checked folders
+- **Confirmation popup** before batch delete: `y`/`Enter` to confirm, `n`/`Esc` to cancel
+- **Two-phase scan**: TUI shows discovered folders immediately (Phase 1), sizes computed in background (Phase 2 via `du`)
+- **Project marker detection**: Skips deep recursion into directories without `package.json`, `yarn.lock`, `bun.lock`, `deno.lockb`, or `pnpm-lock.yaml` beyond depth 4
+- **Interactive max-depth** setting in Settings popup (cycles: 2 → 3 → 5 → 10 → ∞)
+- **Search path** shown in status bar during scan
+
+### Changed
+- Phase 2 sizing uses `du -sb` instead of WalkDir (WalkDir fallback if `du` unavailable)
+- Phase 2 runs sequentially (no Rayon) to avoid disk I/O contention from parallel `du` processes
+- Mtime uses cheap single `stat` call instead of full WalkDir traversal
+- `process_scan_results` called before Phase 2 — TUI no longer freezes during sizing
+
+### Keybindings changed
+- `Space` now toggles checkbox (was `Enter`/`Space` delete)
+- `Enter` still deletes selected folder immediately
+- `Ctrl+D` opens batch-delete confirmation for checked folders
+
 ## [0.4.0] - 2026-06-25
 
 ### Added

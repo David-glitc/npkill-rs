@@ -53,6 +53,9 @@ pub struct CliArgs {
 
     #[arg(short = 'm', long)]
     pub max_depth: Option<usize>,
+
+    #[arg(long)]
+    pub include_hidden: bool,
 }
 
 impl From<CliArgs> for ScanConfig {
@@ -89,6 +92,7 @@ impl From<CliArgs> for ScanConfig {
             delete_all: args.delete_all,
             yes: args.yes,
             max_depth: args.max_depth.or(Some(5)),
+            include_hidden: args.include_hidden,
         }
     }
 }
@@ -114,6 +118,7 @@ mod tests {
             json: false,
             table: false,
             max_depth: None,
+            include_hidden: false,
         };
         let config: ScanConfig = args.into();
         assert_eq!(config.targets.len(), 2);
@@ -138,6 +143,7 @@ mod tests {
             json: false,
             table: false,
             max_depth: None,
+            include_hidden: false,
         };
         let config: ScanConfig = args.into();
         assert_eq!(config.blacklist, vec!["/tmp"]);

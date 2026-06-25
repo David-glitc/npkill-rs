@@ -1,9 +1,9 @@
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::risk;
@@ -44,22 +44,26 @@ impl Scanner {
         self.stop_flag.store(true, Ordering::SeqCst);
     }
 
-    pub fn scan(&self) -> Vec<FoundFolder> {
+    /// Phase 1: telescope + walk, returns discovered targets (no sizes).
+    pub fn scan_phase1(&self) -> Vec<FoundFolder> {
         if !self.config.root_path.exists() {
             return Vec::new();
         }
-
-        // ── Telescope: count total dirs upfront for accurate progress ──
         self.telescope_dir_count();
+        self.walk_for_targets()
+    }
 
-        // ── Phase 1: walk the tree, find targets (skip their contents) ──
-        let mut results = self.walk_for_targets();
-
-        // ── Phase 2: compute sizes (+ ages) in parallel ──
+    /// Phase 2: compute sizes (+ ages) on already-discovered targets.
+    pub fn compute_stats(&self, folders: &mut [FoundFolder]) {
         if !self.config.disable_size || !self.config.disable_age {
-            self.compute_stats_parallel(&mut results);
+            self.compute_stats_parallel(folders);
         }
+    }
 
+    /// Full scan: Phase 1 + Phase 2.
+    pub fn scan(&self) -> Vec<FoundFolder> {
+        let mut results = self.scan_phase1();
+        self.compute_stats(&mut results);
         results
     }
 
@@ -162,6 +166,10 @@ impl Scanner {
                 Err(_) => continue,
             };
 
+            // Check if this directory has project markers (package.json etc).
+            // Dirs without markers rarely contain node_modules subtrees.
+            let has_project_marker = entries.iter().any(|e| is_project_marker(&e.name));
+
             for entry in &entries {
                 if self.stop_flag.load(Ordering::SeqCst) {
                     break;
@@ -183,9 +191,10 @@ impl Scanner {
 
                 if let Some(target) = self.is_target(&entry.name) {
                     self.record_target(&path, target, &mut results);
-                } else {
+                } else if has_project_marker || entry_depth <= 4 {
                     stack.push((path, entry_depth));
                 }
+                // else: no project marker + deep → skip recursion
             }
         }
 
@@ -229,13 +238,17 @@ impl Scanner {
         results.push(folder);
     }
 
-    /// Phase 2: compute sizes (+ ages) for all discovered targets in parallel.
-    pub(crate) fn compute_stats_parallel(&self, folders: &mut Vec<FoundFolder>) {
+    /// Phase 2: compute sizes (+ ages) for all discovered targets sequentially
+    /// (sequential avoids disk I/O contention from parallel `du` subprocesses).
+    pub(crate) fn compute_stats_parallel(&self, folders: &mut [FoundFolder]) {
         let progress = self.progress.clone();
         let disable_size = self.config.disable_size;
         let disable_age = self.config.disable_age;
 
-        folders.par_iter_mut().for_each(|f| {
+        for f in folders.iter_mut() {
+            if self.stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
             if disable_size && disable_age {
                 return;
             }
@@ -255,7 +268,7 @@ impl Scanner {
                     prog.total_size_reclaimable += sz;
                 }
             }
-        });
+        }
     }
 
     fn is_target(&self, dir_name: &str) -> Option<TargetKind> {
@@ -277,6 +290,15 @@ impl Scanner {
             }
         }
 
+        // Skip hidden directories by default (matches npkill behavior)
+        if !self.config.include_hidden {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') && self.is_target(name).is_none() {
+                    return false;
+                }
+            }
+        }
+
         // Blacklist check
         for bl in &self.config.blacklist {
             if path_str.contains(bl) {
@@ -294,37 +316,57 @@ impl Scanner {
         true
     }
 
-    /// Single-pass size + newest-mtime under `path` (avoids walking the tree twice).
-    pub fn get_dir_stats(path: &Path) -> (Option<u64>, Option<i64>) {
-        let mut total = 0u64;
-        let mut newest: Option<i64> = None;
-        for entry in WalkDir::new(path)
-            .follow_links(false)
-            .same_file_system(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                    if let Ok(modified) = meta.modified() {
-                        if let Ok(dur) = modified.duration_since(SystemTime::UNIX_EPOCH) {
-                            let ts = dur.as_secs() as i64;
-                            if newest.is_none_or(|n| ts > n) {
-                                newest = Some(ts);
-                            }
-                        }
-                    }
-                }
-            }
+    /// Fast directory size using `du`, falls back to WalkDir.
+    fn get_dir_size_fast(path: &Path) -> Option<u64> {
+        #[cfg(target_os = "macos")]
+        let output = Command::new("du").arg("-sk").arg(path).output().ok()?;
+        #[cfg(not(target_os = "macos"))]
+        let output = Command::new("du").arg("-sb").arg(path).output().ok()?;
+
+        if !output.status.success() {
+            return None;
         }
-        (Some(total), newest)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let size_str = stdout.split_whitespace().next()?;
+        #[cfg(target_os = "macos")]
+        let size = size_str.parse::<u64>().ok()? * 1024;
+        #[cfg(not(target_os = "macos"))]
+        let size = size_str.parse::<u64>().ok()?;
+        Some(size)
     }
 
-    /// Recursively sum file sizes under `path` using walkdir (faster than manual
-    /// recursive `fs::read_dir` — walkdir batches directory opens and avoids
-    /// redundant stat calls). Only reads filesystem *metadata*, never file contents.
+    /// Fast last-modified time of the directory itself (one cheap stat call).
+    fn get_dir_mtime(path: &Path) -> Option<i64> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?;
+        let dur = modified.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        Some(dur.as_secs() as i64)
+    }
+
+    /// Size + mtime using fast methods, WalkDir fallback.
+    pub fn get_dir_stats(path: &Path) -> (Option<u64>, Option<i64>) {
+        let size = Self::get_dir_size_fast(path).or_else(|| {
+            Some(
+                WalkDir::new(path)
+                    .follow_links(false)
+                    .same_file_system(false)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum(),
+            )
+        });
+        let mtime = Self::get_dir_mtime(path);
+        (size, mtime)
+    }
+
+    /// Recursively sum file sizes under `path`.
     pub fn get_dir_size(path: &Path) -> u64 {
+        if let Some(size) = Self::get_dir_size_fast(path) {
+            return size;
+        }
         WalkDir::new(path)
             .follow_links(false)
             .same_file_system(false)
@@ -338,16 +380,18 @@ impl Scanner {
 
     /// Newest modification time under `path`.
     pub fn get_last_modified(path: &Path) -> Option<i64> {
-        WalkDir::new(path)
-            .follow_links(false)
-            .same_file_system(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.metadata().ok())
-            .filter_map(|m| m.modified().ok())
-            .filter_map(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .max()
+        Self::get_dir_mtime(path).or_else(|| {
+            WalkDir::new(path)
+                .follow_links(false)
+                .same_file_system(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .filter_map(|m| m.modified().ok())
+                .filter_map(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .max()
+        })
     }
 }
 
@@ -355,6 +399,20 @@ impl Drop for Scanner {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Common project marker files that indicate a directory is a JS/TS project root.
+/// Directories without these rarely contain node_modules subtrees.
+fn is_project_marker(name: &str) -> bool {
+    matches!(
+        name,
+        "package.json"
+            | "yarn.lock"
+            | "bun.lock"
+            | "deno.lockb"
+            | "pnpm-lock.yaml"
+            | "package-lock.json"
+    )
 }
 
 #[cfg(test)]

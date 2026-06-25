@@ -104,6 +104,7 @@ pub struct ScanConfig {
     pub delete_all: bool,
     pub yes: bool,
     pub max_depth: Option<usize>,
+    pub include_hidden: bool,
 }
 
 impl Default for ScanConfig {
@@ -121,6 +122,7 @@ impl Default for ScanConfig {
             delete_all: false,
             yes: false,
             max_depth: Some(5),
+            include_hidden: false,
         }
     }
 }
