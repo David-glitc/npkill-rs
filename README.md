@@ -9,7 +9,7 @@ Created by [David Pere](https://kierkegaard.space) — [@davidpereishim](https:/
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/master/install.sh | bash
 ```
 
 This downloads the latest binary for your platform, installs it to `~/.local/bin`, and adds it to your `PATH`.
@@ -34,12 +34,12 @@ This downloads the latest binary for your platform, installs it to `~/.local/bin
 
 **Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/master/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/David-glitc/npkill-rs/master/install.ps1 | iex
 ```
 
 Supports Linux (x86_64, aarch64) and Windows (x86_64).

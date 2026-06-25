@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # npkill-rs Windows installer
-# Run: irm https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.ps1 | iex
+# Run: irm https://raw.githubusercontent.com/David-glitc/npkill-rs/master/install.ps1 | iex
 
 $Repo = "David-glitc/npkill-rs"
 $BinName = "npkill-rs"
