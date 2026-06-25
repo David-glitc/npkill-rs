@@ -14,7 +14,7 @@ Write-Bold "npkill-rs installer for Windows"
 
 # ── Detect architecture ───────────────────────────────────────
 $Arch = if ([Environment]::Is64BitOperatingSystem) { "x86_64" } else { "i686" }
-$Target = "${Arch}-pc-windows-msvc"
+$Target = "${Arch}-pc-windows-gnu"
 Write-Info "Detected target: $Target"
 
 # ── Get latest release tag ────────────────────────────────────
