@@ -130,6 +130,15 @@ fn main() -> anyhow::Result<()> {
         eprintln!("[DRY RUN] No folders will actually be deleted.");
     }
 
+    // ── Update check ──
+    let update_available = npkill_rs::update::check_for_update();
+    if let Some(info) = &update_available {
+        eprintln!(
+            "⚡ Update available: {} → {} — run `curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/master/install.sh | bash`",
+            info.current, info.latest
+        );
+    }
+
     // ── JSON mode ──
     if is_json {
         let scanner_config = config.clone();
@@ -250,7 +259,11 @@ fn main() -> anyhow::Result<()> {
     // ── TUI mode ──
     let progress = ScanProgress::new();
 
-    let mut app = Arc::new(Mutex::new(App::new(config)));
+    let mut app = {
+        let mut a = App::new(config);
+        a.update_available = update_available.as_ref().map(|info| info.latest.clone());
+        Arc::new(Mutex::new(a))
+    };
 
     let scanner_config = app.lock().unwrap().config.clone();
     let scanner = Scanner::new(scanner_config).with_progress(progress.clone());

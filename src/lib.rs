@@ -4,3 +4,4 @@ pub mod deleter;
 pub mod risk;
 pub mod scanner;
 pub mod types;
+pub mod update;

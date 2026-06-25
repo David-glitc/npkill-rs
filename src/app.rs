@@ -49,6 +49,7 @@ pub struct App {
     pub settings_cursor: usize,
     /// True when a popup (settings/help) is open over the scan tab.
     pub popup_open: bool,
+    pub update_available: Option<String>,
 }
 
 impl App {
@@ -78,6 +79,7 @@ impl App {
             theme: Theme::Catppuccino,
             settings_cursor: 0,
             popup_open: false,
+            update_available: None,
         }
     }
 
@@ -1165,6 +1167,12 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
         right_parts.push(Span::styled(
             " SCANNING ",
             Style::default().fg(p.bg).bg(p.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(ref ver) = app.update_available {
+        right_parts.push(Span::styled(
+            format!(" UPDATE {ver} "),
+            Style::default().fg(p.bg).bg(p.warning).add_modifier(Modifier::BOLD),
         ));
     }
 
