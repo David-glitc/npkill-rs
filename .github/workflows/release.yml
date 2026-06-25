@@ -43,6 +43,7 @@ jobs:
 
       - name: Package binaries
         run: |
+          mkdir -p release_assets
           # x86_64 Linux
           cd target/x86_64-unknown-linux-gnu/release
           tar czf ../../../release_assets/${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu.tar.gz ${{ env.BIN_NAME }}
