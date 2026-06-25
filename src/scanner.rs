@@ -1,18 +1,19 @@
-use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::risk;
-use crate::types::{FoundFolder, FolderStatus, RiskLevel, ScanConfig, TargetKind};
+use crate::types::{FolderStatus, FoundFolder, RiskLevel, ScanConfig, ScanProgress, TargetKind};
 
 pub struct Scanner {
     pub config: ScanConfig,
     stop_flag: Arc<AtomicBool>,
     pub current_path: Option<Arc<Mutex<String>>>,
+    pub progress: Option<Arc<Mutex<ScanProgress>>>,
 }
 
 impl Scanner {
@@ -21,11 +22,17 @@ impl Scanner {
             config,
             stop_flag: Arc::new(AtomicBool::new(false)),
             current_path: None,
+            progress: None,
         }
     }
 
     pub fn with_current_path(mut self, path: Arc<Mutex<String>>) -> Self {
         self.current_path = Some(path);
+        self
+    }
+
+    pub fn with_progress(mut self, progress: Arc<Mutex<ScanProgress>>) -> Self {
+        self.progress = Some(progress);
         self
     }
 
@@ -38,72 +45,127 @@ impl Scanner {
     }
 
     pub fn scan(&self) -> Vec<FoundFolder> {
-        let mut results = Vec::new();
-
         if !self.config.root_path.exists() {
-            return results;
+            return Vec::new();
         }
 
-        let walker = WalkDir::new(&self.config.root_path)
-            .follow_links(false)
-            .same_file_system(true)
-            .max_open(256);
+        // ── Phase 1: walk the tree, find targets (skip their contents) ──
+        let mut results = self.walk_for_targets();
 
-        for entry in walker.into_iter().filter_map(|e| e.ok()) {
+        // ── Phase 2: compute sizes (+ ages) in parallel ──
+        if !self.config.disable_size || !self.config.disable_age {
+            self.compute_stats_parallel(&mut results);
+        }
+
+        results
+    }
+
+    /// Phase 1: walk directory tree, identify target dirs, skip walking into them.
+    /// Uses manual `read_dir` traversal instead of WalkDir because WalkDir's
+    /// filter_entry still opens discovered targets to read their children,
+    /// adding 10+ ms on large node_modules trees. Manual traversal never opens
+    /// discovered targets — it detects them by name from the parent read_dir.
+    fn walk_for_targets(&self) -> Vec<FoundFolder> {
+        let mut results = Vec::new();
+        let mut dirs_to_visit = vec![self.config.root_path.clone()];
+
+        while let Some(dir) = dirs_to_visit.pop() {
             if self.stop_flag.load(Ordering::SeqCst) {
                 break;
             }
 
-            let path = entry.path();
+            // Update progress
+            if let Some(ref p) = self.progress {
+                let mut prog = p.lock().unwrap();
+                prog.dirs_visited += 1;
+                prog.current_path = dir.display().to_string();
+            }
             if let Some(ref cp) = self.current_path {
                 let mut p = cp.lock().unwrap();
-                *p = path.display().to_string();
+                *p = dir.display().to_string();
             }
-            if !entry.file_type().is_dir() {
+
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
-            }
+            };
 
-            if !self.is_allowed(path) {
-                continue;
-            }
-
-            let dir_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-
-            if let Some(target) = self.is_target(dir_name) {
-                let (risk_level, risk_reason) = risk::analyze(path);
-
-                if self.config.exclude_sensitive && risk_level == RiskLevel::Sensitive {
+            for entry in entries {
+                if self.stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if !ft.is_dir() {
                     continue;
                 }
 
-                let size = if self.config.disable_size {
-                    None
-                } else {
-                    Some(Self::get_dir_size(path))
-                };
+                let path = entry.path();
+                if !self.is_allowed(&path) {
+                    continue;
+                }
 
-                let last_modified = if self.config.disable_age {
-                    None
-                } else {
-                    Self::get_last_modified(path)
-                };
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                results.push(FoundFolder {
-                    path: path.to_path_buf(),
-                    target,
-                    size,
-                    last_modified,
-                    status: FolderStatus::Pending,
-                    risk: risk_level,
-                    risk_reason,
-                });
+                if let Some(target) = self.is_target(dir_name) {
+                    let (risk_level, risk_reason) = risk::analyze(&path);
+                    if self.config.exclude_sensitive && risk_level == RiskLevel::Sensitive {
+                        continue;
+                    }
+
+                    if let Some(ref prog) = self.progress {
+                        let mut p = prog.lock().unwrap();
+                        p.folders_found += 1;
+                    }
+
+                    results.push(FoundFolder {
+                        path,
+                        target,
+                        size: None,
+                        last_modified: None,
+                        status: FolderStatus::Pending,
+                        risk: risk_level,
+                        risk_reason,
+                    });
+                } else {
+                    // Not a target, recurse deeper
+                    dirs_to_visit.push(path);
+                }
             }
         }
-
         results
+    }
+
+    /// Phase 2: compute sizes (+ ages) for all discovered targets in parallel.
+    fn compute_stats_parallel(&self, folders: &mut Vec<FoundFolder>) {
+        let progress = self.progress.clone();
+        let disable_size = self.config.disable_size;
+        let disable_age = self.config.disable_age;
+
+        folders.par_iter_mut().for_each(|f| {
+            if disable_size && disable_age {
+                return;
+            }
+            let (size, age) = if disable_size {
+                (None, Self::get_last_modified(&f.path))
+            } else if disable_age {
+                (Some(Self::get_dir_size(&f.path)), None)
+            } else {
+                Self::get_dir_stats(&f.path)
+            };
+            f.size = size;
+            f.last_modified = age;
+
+            if let Some(ref p) = progress {
+                let mut prog = p.lock().unwrap();
+                if let Some(sz) = size {
+                    prog.total_size_reclaimable += sz;
+                }
+            }
+        });
     }
 
     fn is_target(&self, dir_name: &str) -> Option<TargetKind> {
@@ -142,30 +204,19 @@ impl Scanner {
         true
     }
 
-    pub fn get_dir_size(path: &Path) -> u64 {
+    /// Single-pass size + newest-mtime under `path` (avoids walking the tree twice).
+    pub fn get_dir_stats(path: &Path) -> (Option<u64>, Option<i64>) {
         let mut total = 0u64;
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_symlink() {
-                    continue;
-                }
-                if path.is_dir() {
-                    total += Self::get_dir_size(&path);
-                } else if let Ok(meta) = fs::metadata(&path) {
-                    total += meta.len();
-                }
-            }
-        }
-        total
-    }
-
-    pub fn get_last_modified(path: &Path) -> Option<i64> {
         let mut newest: Option<i64> = None;
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Ok(meta) = fs::metadata(&path) {
+        for entry in WalkDir::new(path)
+            .follow_links(false)
+            .same_file_system(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_type().is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
                     if let Ok(modified) = meta.modified() {
                         if let Ok(dur) = modified.duration_since(SystemTime::UNIX_EPOCH) {
                             let ts = dur.as_secs() as i64;
@@ -177,7 +228,36 @@ impl Scanner {
                 }
             }
         }
-        newest
+        (Some(total), newest)
+    }
+
+    /// Recursively sum file sizes under `path` using walkdir (faster than manual
+    /// recursive `fs::read_dir` — walkdir batches directory opens and avoids
+    /// redundant stat calls). Only reads filesystem *metadata*, never file contents.
+    pub fn get_dir_size(path: &Path) -> u64 {
+        WalkDir::new(path)
+            .follow_links(false)
+            .same_file_system(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Newest modification time under `path`.
+    pub fn get_last_modified(path: &Path) -> Option<i64> {
+        WalkDir::new(path)
+            .follow_links(false)
+            .same_file_system(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .filter_map(|m| m.modified().ok())
+            .filter_map(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .max()
     }
 }
 
@@ -215,8 +295,12 @@ mod tests {
         let scanner = Scanner::new(config);
         let results = scanner.scan();
         assert_eq!(results.len(), 2);
-        let has_nm = results.iter().any(|f| f.path.ends_with("node_modules") && f.target == TargetKind::NodeModules);
-        let has_next = results.iter().any(|f| f.path.ends_with(".next") && f.target == TargetKind::NextDotNext);
+        let has_nm = results
+            .iter()
+            .any(|f| f.path.ends_with("node_modules") && f.target == TargetKind::NodeModules);
+        let has_next = results
+            .iter()
+            .any(|f| f.path.ends_with(".next") && f.target == TargetKind::NextDotNext);
         assert!(has_nm);
         assert!(has_next);
     }

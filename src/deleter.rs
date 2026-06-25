@@ -26,7 +26,10 @@ pub fn delete_folder(folder: &FoundFolder, dry_run: bool) -> DeleteResult {
 }
 
 #[allow(dead_code)]
-pub fn batch_delete<'a>(folders: &'a [&'a FoundFolder], dry_run: bool) -> Vec<(&'a FoundFolder, DeleteResult)> {
+pub fn batch_delete<'a>(
+    folders: &'a [&'a FoundFolder],
+    dry_run: bool,
+) -> Vec<(&'a FoundFolder, DeleteResult)> {
     folders
         .iter()
         .map(|f| (*f, delete_folder(f, dry_run)))

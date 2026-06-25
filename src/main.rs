@@ -2,10 +2,15 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use npkill_rs::app::App;
 use npkill_rs::config::CliArgs;
 use npkill_rs::scanner::Scanner;
+use npkill_rs::types::ScanProgress;
 
 fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
@@ -25,24 +30,29 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let current_scan_path: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let progress = ScanProgress::new();
 
     let mut app = Arc::new(Mutex::new(App::new(config)));
 
     let scanner_config = app.lock().unwrap().config.clone();
-    let scanner = Scanner::new(scanner_config).with_current_path(current_scan_path.clone());
+    let scanner = Scanner::new(scanner_config).with_progress(progress.clone());
     let stop_flag = scanner.stop_flag();
 
     let app_clone = app.clone();
-    let cp_clone = current_scan_path.clone();
+    let prog_clone = progress.clone();
     let scan_handle = std::thread::spawn(move || {
         let results = scanner.scan();
         let mut a = app_clone.lock().unwrap();
-        a.current_scan_path = cp_clone.lock().unwrap().clone();
         a.process_scan_results(results);
+        // Final sync of incremental progress
+        let p = prog_clone.lock().unwrap();
+        a.current_scan_path = p.current_path.clone();
+        a.stats.total_found = a.stats.total_found.max(p.folders_found);
+        a.stats.total_size_reclaimable =
+            a.stats.total_size_reclaimable.max(p.total_size_reclaimable);
     });
 
-    let tui_result = npkill_rs::app::run_tui(&mut app, current_scan_path);
+    let tui_result = npkill_rs::app::run_tui(&mut app, progress);
 
     stop_flag.store(true, Ordering::SeqCst);
 

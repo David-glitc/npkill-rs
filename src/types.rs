@@ -1,6 +1,26 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+
+/// Shared scan progress updated live by the scanner, read by the TUI.
+pub struct ScanProgress {
+    pub folders_found: usize,
+    pub total_size_reclaimable: u64,
+    pub dirs_visited: u64,
+    pub current_path: String,
+}
+
+impl ScanProgress {
+    pub fn new() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            folders_found: 0,
+            total_size_reclaimable: 0,
+            dirs_visited: 0,
+            current_path: String::new(),
+        }))
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FoundFolder {
