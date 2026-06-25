@@ -731,6 +731,7 @@ dependencies = [
  "crossterm",
  "dirs-next",
  "humansize",
+ "libc",
  "mimalloc",
  "predicates",
  "ratatui",

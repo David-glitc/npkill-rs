@@ -71,6 +71,10 @@ impl From<CliArgs> for ScanConfig {
 
         let mut exclude = args.exclude;
         exclude.push(".git".to_string());
+        // Skip common cache/config/system dirs that never have project node_modules
+        for d in &[".cache", ".config", ".local", "Library", "AppData", "snap", "flatpak"] {
+            exclude.push(d.to_string());
+        }
 
         ScanConfig {
             root_path: args.directory,

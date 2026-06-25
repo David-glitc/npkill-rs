@@ -69,14 +69,12 @@ impl Scanner {
         let mut dirs = vec![self.config.root_path.clone()];
         while let Some(dir) = dirs.pop() {
             count += 1;
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if let Ok(ft) = entry.file_type() {
-                        if ft.is_dir() {
-                            let path = entry.path();
-                            if self.is_allowed(&path) {
-                                dirs.push(path);
-                            }
+            if let Ok(entries) = crate::readdir::read_dir_fast(&dir) {
+                for entry in &entries {
+                    if entry.is_dir {
+                        let path = dir.join(&entry.name);
+                        if self.is_allowed(&path) {
+                            dirs.push(path);
                         }
                     }
                 }
@@ -89,91 +87,146 @@ impl Scanner {
     }
 
     /// Phase 1: walk directory tree, identify target dirs, skip walking into them.
-    /// Uses manual `read_dir` traversal instead of WalkDir because WalkDir's
-    /// filter_entry still opens discovered targets to read their children,
-    /// adding 10+ ms on large node_modules trees. Manual traversal never opens
-    /// discovered targets — it detects them by name from the parent read_dir.
+    /// Uses manual `read_dir` traversal with optional parallelism at the top level.
     pub(crate) fn walk_for_targets(&self) -> Vec<FoundFolder> {
-        let mut results = Vec::new();
         let max_depth = self.config.max_depth;
-        let mut dirs_to_visit = vec![(self.config.root_path.clone(), 0usize)];
 
-        while let Some((dir, depth)) = dirs_to_visit.pop() {
+        // Fast path: if max_depth is 0, only check root itself (never finds targets)
+        if max_depth == Some(0) {
+            return Vec::new();
+        }
+
+        // Read root entries using fast getdents64 syscall
+        let entries = match crate::readdir::read_dir_fast(&self.config.root_path) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        // Count root dir as visited
+        self.report_dir_visited(&self.config.root_path);
+
+        // Scan root entries: collect targets and subdirs to walk
+        let mut results = Vec::new();
+        let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+
+        for entry in &entries {
+            if self.stop_flag.load(Ordering::SeqCst) {
+                return results;
+            }
+            if !entry.is_dir {
+                continue;
+            }
+
+            let path = self.config.root_path.join(&entry.name);
+            if !self.is_allowed(&path) {
+                continue;
+            }
+
+            if let Some(target) = self.is_target(&entry.name) {
+                self.record_target(&path, target, &mut results);
+            } else if max_depth.is_none_or(|md| 1 <= md) {
+                subdirs.push(path);
+            }
+        }
+
+        // Parallel walk each top-level subdirectory
+        if !subdirs.is_empty() {
+            use rayon::prelude::*;
+            let sub_results: Vec<Vec<FoundFolder>> = subdirs
+                .par_iter()
+                .map(|path| self.walk_subtree(path, 1, max_depth))
+                .collect();
+
+            for mut r in sub_results {
+                results.append(&mut r);
+            }
+        }
+
+        results
+    }
+
+    /// Walk a single subtree sequentially from a given root + depth.
+    fn walk_subtree(&self, root: &std::path::Path, depth: usize, max_depth: Option<usize>) -> Vec<FoundFolder> {
+        let mut results = Vec::new();
+        let mut stack = vec![(root.to_path_buf(), depth)];
+
+        while let Some((dir, depth)) = stack.pop() {
             if self.stop_flag.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Update progress
-            if let Some(ref p) = self.progress {
-                let mut prog = p.lock().unwrap();
-                prog.dirs_visited += 1;
-                prog.current_path = dir.display().to_string();
-            }
-            if let Some(ref cp) = self.current_path {
-                let mut p = cp.lock().unwrap();
-                *p = dir.display().to_string();
-            }
+            self.report_dir_visited(&dir);
 
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
+            let entries = match crate::readdir::read_dir_fast(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
             };
 
-            for entry in entries {
+            for entry in &entries {
                 if self.stop_flag.load(Ordering::SeqCst) {
                     break;
                 }
-                let Ok(entry) = entry else {
-                    continue;
-                };
-                let Ok(ft) = entry.file_type() else {
-                    continue;
-                };
-                if !ft.is_dir() {
+                if !entry.is_dir {
                     continue;
                 }
 
-                let path = entry.path();
+                let path = dir.join(&entry.name);
                 if !self.is_allowed(&path) {
                     continue;
                 }
 
-                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let entry_depth = depth + 1;
 
                 if max_depth.is_some_and(|md| entry_depth > md) {
                     continue;
                 }
 
-                if let Some(target) = self.is_target(dir_name) {
-                    let (risk_level, risk_reason) = risk::analyze(&path);
-                    if self.config.exclude_sensitive && risk_level == RiskLevel::Sensitive {
-                        continue;
-                    }
-
-                    let folder = FoundFolder {
-                        path: path.clone(),
-                        target,
-                        size: None,
-                        last_modified: None,
-                        status: FolderStatus::Pending,
-                        risk: risk_level,
-                        risk_reason,
-                    };
-
-                    if let Some(ref prog) = self.progress {
-                        let mut p = prog.lock().unwrap();
-                        p.folders_found += 1;
-                        p.pending_folders.push(folder.clone());
-                    }
-
-                    results.push(folder);
+                if let Some(target) = self.is_target(&entry.name) {
+                    self.record_target(&path, target, &mut results);
                 } else {
-                    // Not a target, recurse deeper
-                    dirs_to_visit.push((path, entry_depth));
+                    stack.push((path, entry_depth));
                 }
             }
         }
+
         results
+    }
+
+    fn report_dir_visited(&self, dir: &std::path::Path) {
+        if let Some(ref p) = self.progress {
+            let mut prog = p.lock().unwrap();
+            prog.dirs_visited += 1;
+            prog.current_path = dir.display().to_string();
+        }
+        if let Some(ref cp) = self.current_path {
+            let mut p = cp.lock().unwrap();
+            *p = dir.display().to_string();
+        }
+    }
+
+    fn record_target(&self, path: &std::path::Path, target: TargetKind, results: &mut Vec<FoundFolder>) {
+        let (risk_level, risk_reason) = risk::analyze(path);
+        if self.config.exclude_sensitive && risk_level == RiskLevel::Sensitive {
+            return;
+        }
+
+        let folder = FoundFolder {
+            path: path.to_path_buf(),
+            target,
+            size: None,
+            last_modified: None,
+            status: FolderStatus::Pending,
+            risk: risk_level,
+            risk_reason,
+        };
+
+        if let Some(ref prog) = self.progress {
+            let mut p = prog.lock().unwrap();
+            p.folders_found += 1;
+            p.pending_folders.push(folder.clone());
+        }
+
+        results.push(folder);
     }
 
     /// Phase 2: compute sizes (+ ages) for all discovered targets in parallel.
