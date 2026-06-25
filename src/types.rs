@@ -118,3 +118,87 @@ pub enum DeletePhase {
     Fading,
     Done,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Scan,
+    Settings,
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Catppuccino,
+    Nord,
+    TokyoNight,
+}
+
+pub struct ColorPalette {
+    pub bg: Color,
+    pub fg: Color,
+    pub accent: Color,
+    pub highlight_bg: Color,
+    pub highlight_fg: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub error: Color,
+    pub dim: Color,
+    pub surface: Color,
+}
+
+use ratatui::style::Color;
+
+impl Theme {
+    pub fn palette(&self) -> ColorPalette {
+        match self {
+            Theme::Catppuccino => ColorPalette {
+                bg: Color::Rgb(30, 30, 46),
+                fg: Color::Rgb(205, 214, 244),
+                accent: Color::Rgb(137, 180, 250),
+                highlight_bg: Color::Rgb(137, 180, 250),
+                highlight_fg: Color::Rgb(30, 30, 46),
+                success: Color::Rgb(166, 227, 161),
+                warning: Color::Rgb(249, 226, 175),
+                error: Color::Rgb(243, 139, 168),
+                dim: Color::Rgb(108, 112, 134),
+                surface: Color::Rgb(49, 50, 68),
+            },
+            Theme::Nord => ColorPalette {
+                bg: Color::Rgb(46, 52, 64),
+                fg: Color::Rgb(216, 222, 233),
+                accent: Color::Rgb(136, 192, 208),
+                highlight_bg: Color::Rgb(136, 192, 208),
+                highlight_fg: Color::Rgb(46, 52, 64),
+                success: Color::Rgb(163, 190, 140),
+                warning: Color::Rgb(235, 203, 139),
+                error: Color::Rgb(191, 97, 106),
+                dim: Color::Rgb(76, 86, 106),
+                surface: Color::Rgb(59, 66, 82),
+            },
+            Theme::TokyoNight => ColorPalette {
+                bg: Color::Rgb(26, 27, 38),
+                fg: Color::Rgb(169, 177, 214),
+                accent: Color::Rgb(122, 162, 247),
+                highlight_bg: Color::Rgb(122, 162, 247),
+                highlight_fg: Color::Rgb(26, 27, 38),
+                success: Color::Rgb(158, 206, 106),
+                warning: Color::Rgb(224, 175, 104),
+                error: Color::Rgb(219, 75, 95),
+                dim: Color::Rgb(86, 95, 137),
+                surface: Color::Rgb(36, 39, 58),
+            },
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Theme::Catppuccino => "Catppuccino Mocha",
+            Theme::Nord => "Nord",
+            Theme::TokyoNight => "Tokyo Night",
+        }
+    }
+
+    pub fn all() -> &'static [Theme] {
+        &[Theme::Catppuccino, Theme::Nord, Theme::TokyoNight]
+    }
+}
