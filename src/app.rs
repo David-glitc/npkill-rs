@@ -338,22 +338,28 @@ fn run(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut Arc<Mutex<App>>,
 ) -> io::Result<()> {
+    let mut last_render = Instant::now();
+    let min_frame_time = std::time::Duration::from_millis(33);
+
     loop {
         {
             let mut a = app.lock().unwrap();
             a.update_animations();
         }
 
-        terminal.draw(|f| ui(f, app))?;
+        let now = Instant::now();
+        if now - last_render >= min_frame_time {
+            terminal.draw(|f| ui(f, app))?;
+            last_render = now;
+        }
 
-        if event::poll(std::time::Duration::from_millis(100))? {
+        if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 let mut a = app.lock().unwrap();
 
-                // Global keys
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         if a.search_mode {
@@ -378,12 +384,14 @@ fn run(
                     _ => {}
                 }
 
-                // Per-tab keys
                 match a.active_tab {
                     Tab::Settings => handle_settings_key(&mut a, key.code),
                     Tab::Help => {}
                     Tab::Scan => handle_scan_key(&mut a, key.code),
                 }
+
+                // Force immediate render on input
+                last_render = Instant::now().checked_sub(min_frame_time).unwrap_or(Instant::now());
             }
 
             if let Event::Mouse(mouse) = event::read()? {
@@ -425,6 +433,8 @@ fn run(
                     }
                     _ => {}
                 }
+
+                last_render = Instant::now().checked_sub(min_frame_time).unwrap_or(Instant::now());
             }
         }
 
@@ -672,6 +682,11 @@ fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
         return;
     }
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
     let items: Vec<ListItem> = app
         .filtered_indices
         .iter()
@@ -692,13 +707,7 @@ fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
             let sz = f.size.map(deleter::format_size).unwrap_or_else(|| "?".into());
             let age = f.last_modified.map_or_else(
                 || String::new(),
-                |ts| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                    format!(" {:3}d", (now - ts) / 86400)
-                },
+                |ts| format!(" {:3}d", (now_secs - ts) / 86400),
             );
             let line = format!(" {sc} [{tag}]{rm} {sz:>10}{age}  {}", f.path.display());
 
