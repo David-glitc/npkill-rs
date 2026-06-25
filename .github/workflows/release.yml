@@ -29,15 +29,17 @@ jobs:
             aarch64-unknown-linux-gnu,
             x86_64-pc-windows-gnu
 
-      - name: Build all targets
-        run: |
-          mkdir -p release_assets
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu; do
-            echo "=== Building $target ==="
-            cargo build --release --target "$target" &
-          done
-          wait
-          echo "=== All builds complete ==="
+      - name: Build x86_64 Linux
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Set env for aarch64 cross-compile
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Build aarch64 Linux
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Build Windows
+        run: cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Package binaries
         run: |
