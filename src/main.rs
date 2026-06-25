@@ -94,6 +94,32 @@ fn print_table(results: &[npkill_rs::types::FoundFolder], config: &npkill_rs::ty
     );
 }
 
+fn parse_indices(input: &str, max: usize) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for part in input.split([',', ' ']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let lo = a.trim().parse::<usize>().unwrap_or(0).saturating_sub(1);
+            let hi = b.trim().parse::<usize>().unwrap_or(max).saturating_sub(1);
+            for i in lo..=hi.min(max.saturating_sub(1)) {
+                if !indices.contains(&i) {
+                    indices.push(i);
+                }
+            }
+        } else if let Ok(n) = part.parse::<usize>() {
+            let idx = n.saturating_sub(1);
+            if idx < max && !indices.contains(&idx) {
+                indices.push(idx);
+            }
+        }
+    }
+    indices.sort();
+    indices
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = CliArgs::parse();
     let is_json = cli.json;
@@ -125,8 +151,98 @@ fn main() -> anyhow::Result<()> {
             println!();
             println!("Deleting all {} folder(s)...", results.len());
             let paths: Vec<&npkill_rs::types::FoundFolder> = results.iter().collect();
-            npkill_rs::deleter::batch_delete(&paths, config.dry_run);
-            println!("Done.");
+            let del_results = npkill_rs::deleter::batch_delete(&paths, config.dry_run);
+            let deleted = del_results
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.1,
+                        npkill_rs::deleter::DeleteResult::Success
+                            | npkill_rs::deleter::DeleteResult::DryRun
+                    )
+                })
+                .count();
+            let total_sz: u64 = results.iter().filter_map(|f| f.size).sum();
+            let mode = if config.dry_run {
+                "would free"
+            } else {
+                "freed"
+            };
+            println!(
+                "Deleted {}/{} folder(s) — {} {mode}",
+                deleted,
+                results.len(),
+                npkill_rs::deleter::format_size(total_sz)
+            );
+        } else if config.yes && !config.delete_all {
+            // --yes without --delete-all: prompt per folder
+            for f in results.iter() {
+                let tag = match f.target {
+                    npkill_rs::types::TargetKind::NodeModules => "NM",
+                    npkill_rs::types::TargetKind::NextDotNext => "NX",
+                };
+                print!(
+                    "Delete [{}] {} ({})? [y/N] ",
+                    tag,
+                    f.path.display(),
+                    f.size
+                        .map(npkill_rs::deleter::format_size)
+                        .unwrap_or_default()
+                );
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).ok();
+                if input.trim().eq_ignore_ascii_case("y") {
+                    let _ = npkill_rs::deleter::delete_folder(f, config.dry_run);
+                }
+            }
+        } else {
+            // Interactive prompt: let user choose
+            println!();
+            println!("Delete folders?");
+            println!("  all          — delete everything");
+            println!("  none / Enter — skip");
+            println!("  1,3,5        — delete by index (comma/space separated)");
+            println!("  1-4          — range");
+            print!("> ");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).ok();
+            let input = input.trim().to_lowercase();
+
+            let indices: Vec<usize> = if input == "all" {
+                (0..results.len()).collect()
+            } else if input.is_empty() || input == "none" {
+                Vec::new()
+            } else {
+                parse_indices(&input, results.len())
+            };
+
+            if !indices.is_empty() {
+                let mode = if config.dry_run { " (dry run)" } else { "" };
+                println!(
+                    "Deleting {}/{} folder(s){mode}...",
+                    indices.len(),
+                    results.len()
+                );
+                for &i in &indices {
+                    if i < results.len() {
+                        let f = &results[i];
+                        println!("  Deleting: {}", f.path.display());
+                        let _ = npkill_rs::deleter::delete_folder(f, config.dry_run);
+                    }
+                }
+                let total_sz: u64 = indices
+                    .iter()
+                    .filter_map(|&i| results.get(i))
+                    .filter_map(|f| f.size)
+                    .sum();
+                println!(
+                    "Done — {} {}freed.",
+                    npkill_rs::deleter::format_size(total_sz),
+                    if config.dry_run { "would be " } else { "" }
+                );
+            }
         }
         return Ok(());
     }
