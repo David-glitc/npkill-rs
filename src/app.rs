@@ -606,34 +606,41 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
 
 fn draw_scan_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let sections = Layout::vertical([
-        Constraint::Length(5), // header (title + stats + scan_path + progress + spacer)
-        Constraint::Length(1), // column headers
-        Constraint::Min(0),    // folder list
+        Constraint::Length(8), // header box (bordered)
+        Constraint::Min(0),    // folder list box (bordered)
     ]);
     let chunks = sections.split(area);
-    if chunks.len() < 3 {
+    if chunks.len() < 2 {
         return;
     }
 
-    draw_scan_header(frame, chunks[0], app, p);
-    draw_column_headers(frame, chunks[1], app, p);
-    draw_folder_list(frame, chunks[2], app, p);
+    draw_scan_header_box(frame, chunks[0], app, p);
+    draw_folder_box(frame, chunks[1], app, p);
 }
 
-fn draw_scan_header(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
-    let rows = Layout::vertical([
-        Constraint::Length(1), // title + sort + search
-        Constraint::Length(1), // stats
-        Constraint::Length(1), // scan path
-        Constraint::Length(1), // progress bar
-        Constraint::Length(1), // spacer line
-    ]);
-    if area.height < 5 {
+fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Scan Summary ")
+        .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height < 5 {
         return;
     }
-    let chunks = rows.split(area);
 
-    // Row 0: title + sort indicator + search hint
+    let rows = Layout::vertical([
+        Constraint::Length(1), // title + sort + search
+        Constraint::Length(1), // stats row 1
+        Constraint::Length(1), // stats row 2 (time + reclaimable)
+        Constraint::Length(1), // scan path
+        Constraint::Length(1), // progress bar
+    ]);
+    let chunks = rows.split(inner);
+
+    // Row 0: app title + sort indicator + search hint
     let title = format!(" npkill-rs v{}", env!("CARGO_PKG_VERSION"));
     let sort_text = app.sort_indicator();
     let search_hint = if app.search_mode {
@@ -645,54 +652,68 @@ fn draw_scan_header(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
     let title_line = Line::from(vec![
         Span::styled(
             &title,
-            Style::default()
-                .fg(p.accent)
-                .add_modifier(Modifier::BOLD)
-                .bg(p.bg),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(&sort_text, Style::default().fg(p.success).bg(p.bg)),
-        Span::styled(&search_hint, Style::default().fg(p.dim).bg(p.bg)),
+        Span::styled(&sort_text, Style::default().fg(p.success)),
+        Span::styled(&search_hint, Style::default().fg(p.dim)),
     ]);
-    frame.render_widget(
-        Paragraph::new(title_line).style(Style::default().bg(p.bg)),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(title_line), chunks[0]);
 
-    // Row 1: stats
+    // Row 1: stats — found / deleted / errors
     let stats_line = format!(
-        " Found: {}  Deleted: {}  Errors: {}  Reclaimable: {}  Freed: {}",
-        app.stats.total_found,
-        app.stats.total_deleted,
-        app.stats.total_errors,
-        deleter::format_size(app.stats.total_size_reclaimable),
-        deleter::format_size(app.stats.total_size_freed),
+        " Found: {}   Deleted: {}   Errors: {}",
+        app.stats.total_found, app.stats.total_deleted, app.stats.total_errors,
     );
-    let stats_para = Paragraph::new(Line::from(Span::styled(
-        &stats_line,
-        Style::default().fg(p.fg).bg(p.bg),
-    )))
-    .style(Style::default().bg(p.bg));
-    frame.render_widget(stats_para, chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            &stats_line,
+            Style::default().fg(p.fg),
+        ))),
+        chunks[1],
+    );
 
-    // Row 2: current scan path
+    // Row 2: reclaimable + scan time
+    let time_str = if app.scan_complete {
+        let s = app.stats.scan_duration_secs;
+        format!("{:.2}s", s)
+    } else if app.stats.total_found > 0 {
+        "scanning...".to_string()
+    } else {
+        "--".to_string()
+    };
+    let time_line = format!(
+        " Reclaimable: {}   Scan time: {}",
+        deleter::format_size(app.stats.total_size_reclaimable),
+        time_str,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            &time_line,
+            Style::default().fg(p.fg),
+        ))),
+        chunks[2],
+    );
+
+    // Row 3: current scan path
     let scan_path = if !app.current_scan_path.is_empty() {
-        format!(" Scanning: {}", app.current_scan_path)
+        format!(" Path: {}", app.current_scan_path)
     } else if !app.scan_complete {
-        " Scanning...".to_string()
+        " Path: scanning...".to_string()
     } else {
         String::new()
     };
     let path_style = if !app.scan_complete {
-        Style::default().fg(p.warning).bg(p.bg)
+        Style::default().fg(p.warning)
     } else {
-        Style::default().fg(p.success).bg(p.bg)
+        Style::default().fg(p.success)
     };
-    let path_para = Paragraph::new(Line::from(Span::styled(&scan_path, path_style)))
-        .style(Style::default().bg(p.bg));
-    frame.render_widget(path_para, chunks[2]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(&scan_path, path_style))),
+        chunks[3],
+    );
 
-    // Row 3: progress bar
+    // Row 4: progress bar (only during scan)
     if !app.scan_complete {
         let spinner = if !app.folders.is_empty() {
             format!("{} ", app.spinner_char())
@@ -703,89 +724,64 @@ fn draw_scan_header(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
             .eta_seconds
             .filter(|&e| e > 0.0)
             .map_or_else(String::new, |eta| format!(" ETA {:.0}s", eta));
-        let progress_str = if !app.scan_complete {
-            format!(" {}", app.scan_progress_bar())
-        } else {
-            String::new()
-        };
-        let status = format!("{}{}{}", spinner, progress_str, eta_str);
-        let status_para = Paragraph::new(Line::from(Span::styled(
-            &status,
-            Style::default().fg(p.accent).bg(p.bg),
-        )))
-        .style(Style::default().bg(p.bg));
-        frame.render_widget(status_para, chunks[3]);
+        let progress_str = app.scan_progress_bar();
+        let status = format!(" {}{}{}", spinner, progress_str, eta_str);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                &status,
+                Style::default().fg(p.accent),
+            ))),
+            chunks[4],
+        );
     }
-
-    // Row 4: spacer — draws a subtle separator line
-    let sep_line = "─".repeat(area.width.saturating_sub(2) as usize);
-    let sep = Paragraph::new(Line::from(Span::styled(
-        &sep_line,
-        Style::default().fg(p.surface).bg(p.bg),
-    )))
-    .style(Style::default().bg(p.bg));
-    frame.render_widget(sep, chunks[4]);
 }
 
-fn draw_column_headers(frame: &mut Frame, area: Rect, _app: &App, p: &ColorPalette) {
-    let header = Line::from(vec![
-        Span::styled(
-            " S [Tag]",
-            Style::default()
-                .fg(p.dim)
-                .bg(p.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            "Size",
-            Style::default()
-                .fg(p.dim)
-                .bg(p.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("     "),
-        Span::styled(
-            "Age",
-            Style::default()
-                .fg(p.dim)
-                .bg(p.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Path",
-            Style::default()
-                .fg(p.dim)
-                .bg(p.bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    let sep_style = Style::default().bg(p.bg);
+fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+    let title = if app.search_query.is_empty() {
+        format!(" Folders ({}) ", app.filtered_indices.len())
+    } else {
+        format!(
+            " Folders ({}/{} filtered) ",
+            app.filtered_indices.len(),
+            app.folders.len()
+        )
+    };
+
     let block = Block::default()
-        .style(sep_style)
-        .borders(Borders::TOP)
-        .border_type(ratatui::widgets::BorderType::Plain)
-        .border_style(Style::default().fg(p.surface));
-    let para = Paragraph::new(header).block(block).style(sep_style);
-    frame.render_widget(para, area);
-}
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg));
 
-fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     if app.filtered_indices.is_empty() {
         let msg = if app.search_query.is_empty() {
-            "No folders found. Scanning..."
+            " No folders found. Scanning..."
         } else {
-            "No folders match your search."
+            " No folders match your search."
         };
-        let para = Paragraph::new(Line::from(Span::styled(
-            msg,
-            Style::default().fg(p.dim).bg(p.bg),
-        )))
-        .block(Block::default().style(Style::default().bg(p.bg)));
-        frame.render_widget(para, area);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(p.dim)))),
+            inner,
+        );
         return;
     }
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Inner layout: column header + list
+    let sections = Layout::vertical([
+        Constraint::Length(1), // column header
+        Constraint::Min(0),    // folder list
+    ]);
+    let chunks = sections.split(inner);
+    if chunks.len() < 2 {
+        return;
+    }
+
+    draw_column_headers(frame, chunks[0], app, p);
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -822,32 +818,16 @@ fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
             let line = format!(" {sc} [{tag}]{rm}  {sz:>8}{age}  {}", f.path.display());
 
             let st = match f.status {
-                FolderStatus::Deleted => Style::default().fg(p.dim).bg(p.bg).crossed_out(),
-                FolderStatus::Error => Style::default().fg(p.error).bg(p.bg),
-                _ if f.risk == RiskLevel::Sensitive => Style::default().fg(p.warning).bg(p.bg),
-                _ => Style::default().fg(p.fg).bg(p.bg),
+                FolderStatus::Deleted => Style::default().fg(p.dim).crossed_out(),
+                FolderStatus::Error => Style::default().fg(p.error),
+                _ if f.risk == RiskLevel::Sensitive => Style::default().fg(p.warning),
+                _ => Style::default().fg(p.fg),
             };
             ListItem::new(line).style(st)
         })
         .collect();
 
-    let title = if app.search_query.is_empty() {
-        format!(" Folders ({}) ", app.filtered_indices.len())
-    } else {
-        format!(
-            " Folders ({}/{} filtered) ",
-            app.filtered_indices.len(),
-            app.folders.len()
-        )
-    };
-
     let list_w = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .style(Style::default().bg(p.bg).fg(p.dim)),
-        )
         .highlight_style(
             Style::default()
                 .fg(p.highlight_fg)
@@ -858,9 +838,43 @@ fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
 
     let mut ls = ListState::default();
     ls.select(app.list_selected);
-    // We can't set offset directly because it's private,
-    // but List handles scroll automatically based on selected item
-    frame.render_stateful_widget(list_w, area, &mut ls);
+    // List handles scroll automatically based on selected item
+    frame.render_stateful_widget(list_w, chunks[1], &mut ls);
+}
+
+fn draw_column_headers(frame: &mut Frame, area: Rect, _app: &App, p: &ColorPalette) {
+    let header = Line::from(vec![
+        Span::styled(
+            " S [Tag]",
+            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "Size",
+            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("     "),
+        Span::styled(
+            "Age",
+            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "Path",
+            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let block = Block::default()
+        .style(Style::default().bg(p.bg))
+        .borders(Borders::TOP)
+        .border_type(ratatui::widgets::BorderType::Plain)
+        .border_style(Style::default().fg(p.surface));
+    frame.render_widget(
+        Paragraph::new(header)
+            .block(block)
+            .style(Style::default().bg(p.bg)),
+        area,
+    );
 }
 
 // ── Settings tab ─────────────────────────────────────────────
