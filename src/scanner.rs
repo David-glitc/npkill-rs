@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use walkdir::WalkDir;
@@ -12,6 +12,7 @@ use crate::types::{FoundFolder, FolderStatus, RiskLevel, ScanConfig, TargetKind}
 pub struct Scanner {
     pub config: ScanConfig,
     stop_flag: Arc<AtomicBool>,
+    pub current_path: Option<Arc<Mutex<String>>>,
 }
 
 impl Scanner {
@@ -19,7 +20,13 @@ impl Scanner {
         Self {
             config,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            current_path: None,
         }
+    }
+
+    pub fn with_current_path(mut self, path: Arc<Mutex<String>>) -> Self {
+        self.current_path = Some(path);
+        self
     }
 
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
@@ -48,6 +55,10 @@ impl Scanner {
             }
 
             let path = entry.path();
+            if let Some(ref cp) = self.current_path {
+                let mut p = cp.lock().unwrap();
+                *p = path.display().to_string();
+            }
             if !entry.file_type().is_dir() {
                 continue;
             }
@@ -158,7 +169,7 @@ impl Scanner {
                     if let Ok(modified) = meta.modified() {
                         if let Ok(dur) = modified.duration_since(SystemTime::UNIX_EPOCH) {
                             let ts = dur.as_secs() as i64;
-                            if newest.map_or(true, |n| ts > n) {
+                            if newest.is_none_or(|n| ts > n) {
                                 newest = Some(ts);
                             }
                         }

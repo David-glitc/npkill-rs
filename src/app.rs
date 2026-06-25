@@ -52,6 +52,7 @@ pub struct App {
     pub eta_seconds: Option<f64>,
     pub scan_progress: f64,
     pub scan_complete: bool,
+    pub current_scan_path: String,
 
     // Theme
     pub theme: Theme,
@@ -83,6 +84,7 @@ impl App {
             eta_seconds: None,
             scan_progress: 0.0,
             scan_complete: false,
+            current_scan_path: String::new(),
             theme: Theme::Catppuccino,
             settings_cursor: 0,
         }
@@ -316,14 +318,17 @@ impl App {
 
 // ── Entry point ──────────────────────────────────────────────
 
-pub fn run_tui(app: &mut Arc<Mutex<App>>) -> io::Result<()> {
+pub fn run_tui(
+    app: &mut Arc<Mutex<App>>,
+    current_scan_path: Arc<Mutex<String>>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(crossterm::event::EnableMouseCapture)?;
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
-    let res = run(&mut terminal, app);
+    let res = run(&mut terminal, app, current_scan_path);
 
     let mut stdout = io::stdout();
     let _ = stdout.execute(crossterm::event::DisableMouseCapture);
@@ -337,6 +342,7 @@ pub fn run_tui(app: &mut Arc<Mutex<App>>) -> io::Result<()> {
 fn run(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut Arc<Mutex<App>>,
+    current_scan_path: Arc<Mutex<String>>,
 ) -> io::Result<()> {
     let mut last_render = Instant::now();
     let min_frame_time = std::time::Duration::from_millis(33);
@@ -345,6 +351,9 @@ fn run(
         {
             let mut a = app.lock().unwrap();
             a.update_animations();
+            if let Ok(p) = current_scan_path.lock() {
+                a.current_scan_path = p.clone();
+            }
         }
 
         let now = Instant::now();
@@ -397,7 +406,7 @@ fn run(
             if let Event::Mouse(mouse) = event::read()? {
                 let mut a = app.lock().unwrap();
                 match mouse.kind {
-                    MouseEventKind::Down(btn) if btn == crossterm::event::MouseButton::Left => {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                         if a.active_tab == Tab::Scan {
                             if let Ok(size) = terminal.size() {
                                 let row = mouse.row as usize;
@@ -414,8 +423,7 @@ fn run(
                             }
                         }
                     }
-                    MouseEventKind::Down(btn)
-                        if btn == crossterm::event::MouseButton::Right =>
+                    MouseEventKind::Down(crossterm::event::MouseButton::Right) =>
                     {
                         if a.active_tab == Tab::Scan {
                             a.delete_selected();
@@ -426,11 +434,10 @@ fn run(
                             a.next(1);
                         }
                     }
-                    MouseEventKind::ScrollUp => {
-                        if a.active_tab == Tab::Scan {
+                    MouseEventKind::ScrollUp
+                        if a.active_tab == Tab::Scan => {
                             a.previous(1);
                         }
-                    }
                     _ => {}
                 }
 
@@ -592,26 +599,34 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
 
 fn draw_scan_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let sections = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
+        Constraint::Length(5),  // header (title + stats + scan_path + progress + spacer)
+        Constraint::Length(1),  // column headers
+        Constraint::Min(0),     // folder list
     ]);
     let chunks = sections.split(area);
+    if chunks.len() < 3 {
+        return;
+    }
 
     draw_scan_header(frame, chunks[0], app, p);
-    draw_folder_list(frame, chunks[1], app, p);
+    draw_column_headers(frame, chunks[1], app, p);
+    draw_folder_list(frame, chunks[2], app, p);
 }
 
 fn draw_scan_header(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(1),  // title + sort + search
+        Constraint::Length(1),  // stats
+        Constraint::Length(1),  // scan path
+        Constraint::Length(1),  // progress bar
+        Constraint::Length(1),  // spacer line
     ]);
-    if area.height < 3 {
+    if area.height < 5 {
         return;
     }
     let chunks = rows.split(area);
 
+    // Row 0: title + sort indicator + search hint
     let title = format!(" npkill-rs v{}", env!("CARGO_PKG_VERSION"));
     let sort_text = app.sort_indicator();
     let search_hint = if app.search_mode {
@@ -628,8 +643,9 @@ fn draw_scan_header(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
     ]);
     frame.render_widget(Paragraph::new(title_line).style(Style::default().bg(p.bg)), chunks[0]);
 
+    // Row 1: stats
     let stats_line = format!(
-        " Found {}  Deleted {}  Errors {}  Reclaimable {}  Freed {}",
+        " Found: {}  Deleted: {}  Errors: {}  Reclaimable: {}  Freed: {}",
         app.stats.total_found,
         app.stats.total_deleted,
         app.stats.total_errors,
@@ -643,27 +659,81 @@ fn draw_scan_header(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
     .style(Style::default().bg(p.bg));
     frame.render_widget(stats_para, chunks[1]);
 
-    let spinner = if !app.scan_complete && !app.folders.is_empty() {
-        format!("{} ", app.spinner_char())
+    // Row 2: current scan path
+    let scan_path = if !app.current_scan_path.is_empty() {
+        format!(" Scanning: {}", app.current_scan_path)
+    } else if !app.scan_complete {
+        " Scanning...".to_string()
     } else {
         String::new()
     };
-    let eta_str = app.eta_seconds.filter(|&e| e > 0.0).map_or_else(
-        || String::new(),
-        |eta| format!(" ETA {:.0}s", eta),
-    );
-    let progress_str = if !app.scan_complete {
-        format!(" {}", app.scan_progress_bar())
+    let path_style = if !app.scan_complete {
+        Style::default().fg(p.warning).bg(p.bg)
     } else {
-        String::new()
+        Style::default().fg(p.success).bg(p.bg)
     };
-    let status = format!("{}{}{} {}", spinner, app.status_message, eta_str, progress_str);
-    let status_para = Paragraph::new(Line::from(Span::styled(
-        &status,
-        Style::default().fg(p.warning).bg(p.bg),
+    let path_para = Paragraph::new(Line::from(Span::styled(
+        &scan_path,
+        path_style,
     )))
     .style(Style::default().bg(p.bg));
-    frame.render_widget(status_para, chunks[2]);
+    frame.render_widget(path_para, chunks[2]);
+
+    // Row 3: progress bar
+    if !app.scan_complete {
+        let spinner = if !app.folders.is_empty() {
+            format!("{} ", app.spinner_char())
+        } else {
+            String::new()
+        };
+        let eta_str = app.eta_seconds.filter(|&e| e > 0.0).map_or_else(
+            String::new,
+            |eta| format!(" ETA {:.0}s", eta),
+        );
+        let progress_str = if !app.scan_complete {
+            format!(" {}", app.scan_progress_bar())
+        } else {
+            String::new()
+        };
+        let status = format!("{}{}{}", spinner, progress_str, eta_str);
+        let status_para = Paragraph::new(Line::from(Span::styled(
+            &status,
+            Style::default().fg(p.accent).bg(p.bg),
+        )))
+        .style(Style::default().bg(p.bg));
+        frame.render_widget(status_para, chunks[3]);
+    }
+
+    // Row 4: spacer — draws a subtle separator line
+    let sep_line = "─".repeat(area.width.saturating_sub(2) as usize);
+    let sep = Paragraph::new(Line::from(Span::styled(
+        &sep_line,
+        Style::default().fg(p.surface).bg(p.bg),
+    )))
+    .style(Style::default().bg(p.bg));
+    frame.render_widget(sep, chunks[4]);
+}
+
+fn draw_column_headers(frame: &mut Frame, area: Rect, _app: &App, p: &ColorPalette) {
+    let header = Line::from(vec![
+        Span::styled(" S [Tag]", Style::default().fg(p.dim).bg(p.bg).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled("Size", Style::default().fg(p.dim).bg(p.bg).add_modifier(Modifier::BOLD)),
+        Span::raw("     "),
+        Span::styled("Age", Style::default().fg(p.dim).bg(p.bg).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("Path", Style::default().fg(p.dim).bg(p.bg).add_modifier(Modifier::BOLD)),
+    ]);
+    let sep_style = Style::default().bg(p.bg);
+    let block = Block::default()
+        .style(sep_style)
+        .borders(Borders::TOP)
+        .border_type(ratatui::widgets::BorderType::Plain)
+        .border_style(Style::default().fg(p.surface));
+    let para = Paragraph::new(header)
+        .block(block)
+        .style(sep_style);
+    frame.render_widget(para, area);
 }
 
 fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
@@ -690,8 +760,8 @@ fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
     let items: Vec<ListItem> = app
         .filtered_indices
         .iter()
-        .enumerate()
-        .map(|(_di, &ri)| {
+        
+        .map(|&ri| {
             let f = &app.folders[ri];
             let tag = match f.target {
                 crate::types::TargetKind::NodeModules => "NM",
@@ -706,10 +776,10 @@ fn draw_folder_list(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) 
             let rm = if f.risk == RiskLevel::Sensitive { "!" } else { " " };
             let sz = f.size.map(deleter::format_size).unwrap_or_else(|| "?".into());
             let age = f.last_modified.map_or_else(
-                || String::new(),
-                |ts| format!(" {:3}d", (now_secs - ts) / 86400),
+                String::new,
+                |ts| format!(" {:>3}d", (now_secs - ts) / 86400),
             );
-            let line = format!(" {sc} [{tag}]{rm} {sz:>10}{age}  {}", f.path.display());
+            let line = format!(" {sc} [{tag}]{rm}  {sz:>8}{age}  {}", f.path.display());
 
             let st = match f.status {
                 FolderStatus::Deleted => Style::default().fg(p.dim).bg(p.bg).crossed_out(),

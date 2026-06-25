@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
 pub struct FoundFolder {
     pub path: PathBuf,
     pub target: TargetKind,
@@ -11,7 +13,7 @@ pub struct FoundFolder {
     pub risk_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum TargetKind {
     NodeModules,
     NextDotNext,
@@ -26,7 +28,7 @@ impl TargetKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum FolderStatus {
     Pending,
     Deleting,
@@ -34,7 +36,7 @@ pub enum FolderStatus {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RiskLevel {
     Safe,
     Sensitive,
