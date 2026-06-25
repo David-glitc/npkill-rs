@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0] - 2026-06-25
+
+### Added
+- Automatic update check on startup (GitHub API, 3s timeout, silent fail)
+- `UPDATE vX.Y.Z` badge in TUI status bar when newer version exists
+- Deletion ETA in stats header (rate × remaining)
+- `run.sh` one-liner: `curl -fsSL https://git.io/npkill-rs | bash -s -- -d .`
+- Telescope pass: upfront directory count for accurate scan progress (`dirs: 123/456`)
+
+### Changed
+- **Default `--max-depth` changed from unlimited to 5** — avoids deep system directory crawls, ~10× faster on large filesystems. Override with `-m N` or `-m 0`.
+- Settings/Help popups are now truly modal (mouse clicks swallowed while open)
+- Scan progress shows `dirs_visited/total_dirs` instead of fake ETA estimate
+
 ## [0.3.0] - 2026-06-25
 
 ### Added
