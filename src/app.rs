@@ -11,7 +11,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui::{Frame, Terminal};
 
@@ -47,6 +47,8 @@ pub struct App {
     pub current_scan_path: String,
     pub theme: Theme,
     pub settings_cursor: usize,
+    /// True when a popup (settings/help) is open over the scan tab.
+    pub popup_open: bool,
 }
 
 impl App {
@@ -58,7 +60,7 @@ impl App {
             list_selected: None,
             scroll_offset: 0,
             stats: AppStats::default(),
-            scan_start: None,
+            scan_start: Some(Instant::now()),
             status_message: "Scanning...".to_string(),
             should_quit: false,
             active_tab: Tab::Scan,
@@ -75,6 +77,7 @@ impl App {
             current_scan_path: String::new(),
             theme: Theme::Catppuccino,
             settings_cursor: 0,
+            popup_open: false,
         }
     }
 
@@ -82,14 +85,18 @@ impl App {
         self.theme.palette()
     }
 
-    pub fn start_scan(&mut self) {
-        self.scan_start = Some(Instant::now());
-        self.status_message = "Scanning...".to_string();
-        self.scan_complete = false;
-    }
-
     pub fn process_scan_results(&mut self, results: Vec<FoundFolder>) {
-        self.folders = results;
+        for r in results {
+            if let Some(existing) = self.folders.iter_mut().find(|f| f.path == r.path) {
+                existing.size = r.size;
+                existing.last_modified = r.last_modified;
+                existing.status = r.status;
+                existing.risk = r.risk;
+                existing.risk_reason = r.risk_reason;
+            } else {
+                self.folders.push(r);
+            }
+        }
         self.stats.total_found = self.folders.len();
         self.stats.total_size_reclaimable = deleter::get_total_size(&self.folders);
         self.scan_complete = true;
@@ -99,7 +106,8 @@ impl App {
         }
         let seconds = self.stats.scan_duration_secs;
         self.status_message = format!(
-            "Scan completed in {seconds:.1}s — {} folder(s) found ({})",
+            "Scan completed in {:.1}s — {} folder(s) found ({})",
+            seconds,
             self.folders.len(),
             deleter::format_size(self.stats.total_size_reclaimable),
         );
@@ -276,8 +284,8 @@ impl App {
         self.delete_animations.retain(|anim| {
             let elapsed = anim.started_at.elapsed().as_millis();
             match anim.phase {
-                DeletePhase::Deleting => elapsed < 300,
-                DeletePhase::Fading => elapsed < 800,
+                DeletePhase::Deleting => elapsed < 500,
+                DeletePhase::Fading => elapsed < 1200,
                 DeletePhase::Done => false,
             }
         });
@@ -301,7 +309,9 @@ impl App {
     }
 
     fn format_duration(secs: f64) -> String {
-        if secs < 1.0 {
+        if secs < 0.001 {
+            "<1ms".to_string()
+        } else if secs < 1.0 {
             format!("{:.0}ms", secs * 1000.0)
         } else if secs < 60.0 {
             format!("{:.1}s", secs)
@@ -310,6 +320,20 @@ impl App {
             let s = (secs as u64) % 60;
             format!("{}m {:02}s", m, s)
         }
+    }
+
+    fn delete_progress(&self, real_idx: usize) -> f64 {
+        for anim in &self.delete_animations {
+            if anim.folder_index == real_idx {
+                let elapsed = anim.started_at.elapsed().as_millis() as f64;
+                return match anim.phase {
+                    DeletePhase::Deleting => (elapsed / 500.0).min(1.0),
+                    DeletePhase::Fading => 1.0,
+                    DeletePhase::Done => 1.0,
+                };
+            }
+        }
+        0.0
     }
 }
 
@@ -341,19 +365,39 @@ fn run(
     let mut last_render = Instant::now();
     let min_frame_time = std::time::Duration::from_millis(33);
 
+    let mut last_sort_count: usize = 0;
+
     loop {
         {
             let mut a = app.lock().unwrap();
             a.update_animations();
-            if let Ok(p) = progress.lock() {
+            if let Ok(mut p) = progress.lock() {
                 a.current_scan_path = p.current_path.clone();
                 a.total_dirs_visited = p.dirs_visited;
                 a.stats.total_found = a.stats.total_found.max(p.folders_found);
                 a.stats.total_size_reclaimable =
                     a.stats.total_size_reclaimable.max(p.total_size_reclaimable);
+
+                // Drain pending folders from scanner
+                for f in p.pending_folders.drain(..) {
+                    if !a.folders.iter().any(|existing| existing.path == f.path) {
+                        a.folders.push(f);
+                    }
+                }
+                if a.folders.len() != last_sort_count && !a.folders.is_empty() {
+                    last_sort_count = a.folders.len();
+                    a.apply_sort();
+                }
+
                 if !a.scan_complete && p.dirs_visited > 0 {
-                    let progress = (p.dirs_visited as f64 * 0.01).min(0.99);
-                    a.scan_progress = progress;
+                    let elapsed = a.scan_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(1.0).max(0.01);
+                    let rate = p.dirs_visited as f64 / elapsed;
+                    if rate > 0.0 {
+                        let remaining_dirs = (p.dirs_visited as f64 * 2.0).max(1000.0);
+                        let eta_secs = (remaining_dirs - p.dirs_visited as f64) / rate;
+                        a.eta_seconds = Some(eta_secs.max(0.0));
+                    }
+                    a.scan_progress = (p.dirs_visited as f64 * 0.02).min(0.99);
                 }
             }
         }
@@ -372,7 +416,12 @@ fn run(
                 let mut a = app.lock().unwrap();
 
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
+                    KeyCode::Esc => {
+                        if a.popup_open {
+                            a.popup_open = false;
+                            a.active_tab = Tab::Scan;
+                            continue;
+                        }
                         if a.search_mode {
                             a.search_mode = false;
                         } else if a.active_tab != Tab::Scan {
@@ -382,23 +431,40 @@ fn run(
                         }
                         continue;
                     }
-                    KeyCode::Char('1') => a.active_tab = Tab::Scan,
-                    KeyCode::Char('2') => a.active_tab = Tab::Settings,
-                    KeyCode::Char('3') => a.active_tab = Tab::Help,
+                    KeyCode::Char('q') => {
+                        if !a.popup_open && !a.search_mode {
+                            a.should_quit = true;
+                        }
+                        continue;
+                    }
+                    KeyCode::Char('2') => {
+                        a.popup_open = true;
+                        a.active_tab = Tab::Settings;
+                    }
+                    KeyCode::Char('3') | KeyCode::Char('?') | KeyCode::Char('h') => {
+                        a.popup_open = true;
+                        a.active_tab = Tab::Help;
+                    }
                     KeyCode::Tab => {
-                        a.active_tab = match a.active_tab {
-                            Tab::Scan => Tab::Settings,
-                            Tab::Settings => Tab::Help,
-                            Tab::Help => Tab::Scan,
-                        };
+                        if a.popup_open {
+                            a.popup_open = false;
+                            a.active_tab = Tab::Scan;
+                        } else {
+                            a.popup_open = true;
+                            a.active_tab = Tab::Settings;
+                        }
                     }
                     _ => {}
                 }
 
-                match a.active_tab {
-                    Tab::Settings => handle_settings_key(&mut a, key.code),
-                    Tab::Help => {}
-                    Tab::Scan => handle_scan_key(&mut a, key.code),
+                if a.popup_open {
+                    match a.active_tab {
+                        Tab::Settings => handle_settings_key(&mut a, key.code),
+                        Tab::Help => {}
+                        _ => {}
+                    }
+                } else if a.active_tab == Tab::Scan {
+                    handle_scan_key(&mut a, key.code);
                 }
 
                 last_render = Instant::now()
@@ -408,9 +474,17 @@ fn run(
 
             if let Event::Mouse(mouse) = event::read()? {
                 let mut a = app.lock().unwrap();
-                match mouse.kind {
-                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        if a.active_tab == Tab::Scan {
+                if a.popup_open {
+                    // Click outside popup closes it
+                    if let MouseEventKind::Down(_) = mouse.kind {
+                        // Only close if we have a way to determine "outside"
+                        // For now: any mouse click closes the popup
+                        a.popup_open = false;
+                        a.active_tab = Tab::Scan;
+                    }
+                } else if a.active_tab == Tab::Scan {
+                    match mouse.kind {
+                        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                             if let Ok(size) = terminal.size() {
                                 let row = mouse.row as usize;
                                 let tab_h = 1;
@@ -425,21 +499,13 @@ fn run(
                                 }
                             }
                         }
-                    }
-                    MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
-                        if a.active_tab == Tab::Scan {
+                        MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
                             a.delete_selected();
                         }
+                        MouseEventKind::ScrollDown => a.next(1),
+                        MouseEventKind::ScrollUp => a.previous(1),
+                        _ => {}
                     }
-                    MouseEventKind::ScrollDown => {
-                        if a.active_tab == Tab::Scan {
-                            a.next(1);
-                        }
-                    }
-                    MouseEventKind::ScrollUp if a.active_tab == Tab::Scan => {
-                        a.previous(1);
-                    }
-                    _ => {}
                 }
 
                 last_render = Instant::now()
@@ -476,7 +542,6 @@ fn handle_scan_key(a: &mut App, code: KeyCode) {
     }
 
     match code {
-        KeyCode::Char('h') | KeyCode::Char('?') => a.active_tab = Tab::Help,
         KeyCode::Char('j') | KeyCode::Down => a.next(1),
         KeyCode::Char('k') | KeyCode::Up => a.previous(1),
         KeyCode::PageDown => a.next(10),
@@ -556,7 +621,12 @@ fn ui(frame: &mut Frame, app: &mut Arc<Mutex<App>>) {
     let chunks = vert.split(frame.area());
 
     draw_tab_bar(frame, chunks[0], &a, &p);
-    draw_content(frame, chunks[1], &a, &p);
+    // Always draw scan tab content as base layer
+    draw_scan_tab(frame, chunks[1], &a, &p);
+    // Overlay popup if open
+    if a.popup_open {
+        draw_popup(frame, frame.area(), &a, &p);
+    }
     draw_status_bar(frame, chunks[2], &a, &p);
 }
 
@@ -571,7 +641,11 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
             1 => Tab::Settings,
             _ => Tab::Help,
         };
-        let is_active = app.active_tab == tab;
+        let is_active = if i > 0 && app.popup_open {
+            app.active_tab == tab
+        } else {
+            !app.popup_open && app.active_tab == tab
+        };
         let style = if is_active {
             Style::default()
                 .bg(p.accent)
@@ -587,29 +661,18 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     frame.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), area);
 }
 
-// ── Content ──────────────────────────────────────────────────
-
-fn draw_content(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
-    match app.active_tab {
-        Tab::Scan => draw_scan_tab(frame, area, app, p),
-        Tab::Settings => draw_settings_tab(frame, area, app, p),
-        Tab::Help => draw_help_tab(frame, area, app, p),
-    }
-}
-
 // ── Scan tab ─────────────────────────────────────────────────
 
 fn draw_scan_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let gap = 1;
     let total = area.height;
-    let header_h = 9.min(total.saturating_sub(1));
+    let header_h = 9.min(total.saturating_sub(2).max(3));
     let sections = Layout::vertical([
         Constraint::Length(header_h),
         Constraint::Length(gap),
         Constraint::Min(0),
     ]);
     let chunks = sections.split(area);
-
     if chunks.len() < 3 {
         return;
     }
@@ -634,16 +697,15 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
     }
 
     let rows = Layout::vertical([
-        Constraint::Length(1), // title + sort + search
-        Constraint::Length(1), // stats row 1 (found/deleted/errors)
-        Constraint::Length(1), // stats row 2 (reclaimable + time)
-        Constraint::Length(1), // scan path
-        Constraint::Length(1), // progress row
-        Constraint::Min(0),    // spacer
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
     ]);
     let chunks = rows.split(inner);
 
-    // Row 0: app title line with sort indicator and search hint
     let sort_text = app.sort_indicator();
     let search_hint = if app.search_mode {
         format!("  / {} ▌", app.search_query)
@@ -651,21 +713,14 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
         "  / search".to_string()
     };
     let title_line = Line::from(vec![
-        Span::styled(
-            " npkill-rs ",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" npkill-rs ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
         Span::styled("|", Style::default().fg(p.dim)),
         Span::raw(" "),
-        Span::styled(
-            &sort_text,
-            Style::default().fg(p.success).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(&sort_text, Style::default().fg(p.success).add_modifier(Modifier::BOLD)),
         Span::styled(&search_hint, Style::default().fg(p.dim)),
     ]);
     frame.render_widget(Paragraph::new(title_line), chunks[0]);
 
-    // Row 1: stats — found / deleted / errors
     let found_str = format!("{}", app.stats.total_found);
     let deleted_str = format!("{}", app.stats.total_deleted);
     let errors_str = format!("{}", app.stats.total_errors);
@@ -674,10 +729,7 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
 
     let stats1 = Line::from(vec![
         Span::styled(" Found:  ", Style::default().fg(p.dim)),
-        Span::styled(
-            &found_str,
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(&found_str, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled("│", Style::default().fg(p.surface)),
         Span::raw("  "),
@@ -691,23 +743,20 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
     ]);
     frame.render_widget(Paragraph::new(stats1), chunks[1]);
 
-    // Row 2: reclaimable + scan time
+    let time_elapsed = app.scan_start.map(|s| App::format_duration(s.elapsed().as_secs_f64())).unwrap_or_default();
     let time_str = if app.scan_complete {
         App::format_duration(app.stats.scan_duration_secs)
     } else {
-        "scanning...".to_string()
+        time_elapsed
     };
     let stats2 = Line::from(vec![
         Span::styled(" Reclaimable: ", Style::default().fg(p.dim)),
-        Span::styled(
-            &reclaimable_str,
-            Style::default().fg(p.warning).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(&reclaimable_str, Style::default().fg(p.warning).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled("│", Style::default().fg(p.surface)),
         Span::raw("  "),
-        Span::styled("Scan time: ", Style::default().fg(p.dim)),
-        Span::styled(&time_str, Style::default().fg(p.accent)),
+        Span::styled("Elapsed: ", Style::default().fg(p.dim)),
+        Span::styled(time_str, Style::default().fg(p.accent)),
         Span::raw("  "),
         Span::styled("│", Style::default().fg(p.surface)),
         Span::raw("  "),
@@ -716,7 +765,6 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
     ]);
     frame.render_widget(Paragraph::new(stats2), chunks[2]);
 
-    // Row 3: current scan path
     let scan_path = if !app.current_scan_path.is_empty() {
         &app.current_scan_path
     } else if !app.scan_complete {
@@ -735,32 +783,31 @@ fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalet
     ]);
     frame.render_widget(Paragraph::new(path_line), chunks[3]);
 
-    // Row 4: progress bar
+    // Row 4: progress
     if !app.scan_complete {
         let spinner = app.spinner_char();
         let dirs = app.total_dirs_visited;
         let found = app.stats.total_found;
-        let progress_str = format!(" {}  dirs: {}  found: {}", spinner, dirs, found);
+        let elapsed = app.scan_start.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let elapsed_str = App::format_duration(elapsed);
+        let eta_str = app
+            .eta_seconds
+            .filter(|&e| e > 0.0 && e.is_finite())
+            .map(App::format_duration)
+            .unwrap_or_default();
+        let eta_display = if !eta_str.is_empty() {
+            format!(" ETA {}", eta_str)
+        } else {
+            String::new()
+        };
+        let progress_str = format!(" {}  {} elapsed{}  dirs: {}  found: {}", spinner, elapsed_str, eta_display, dirs, found);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                &progress_str,
-                Style::default().fg(p.accent),
-            ))),
+            Paragraph::new(Line::from(Span::styled(&progress_str, Style::default().fg(p.accent)))),
             chunks[4],
         );
     } else {
         let gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .borders(Borders::NONE)
-                    .style(Style::default().bg(p.bg)),
-            )
-            .gauge_style(
-                Style::default()
-                    .fg(p.success)
-                    .bg(p.surface)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .gauge_style(Style::default().fg(p.success).bg(p.surface).add_modifier(Modifier::BOLD))
             .percent(100)
             .label(format!(
                 " ✓ {} — {} folders, {}",
@@ -798,7 +845,7 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
             if app.scan_complete {
                 " No folders found."
             } else {
-                " Scanning..."
+                " Searching..."
             }
         } else {
             " No folders match your search."
@@ -814,8 +861,8 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     frame.render_widget(block, area);
 
     let sections = Layout::vertical([
-        Constraint::Length(1), // column header
-        Constraint::Min(0),    // folder list
+        Constraint::Length(1),
+        Constraint::Min(0),
     ]);
     let chunks = sections.split(inner);
     if chunks.len() < 2 {
@@ -850,25 +897,49 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
             } else {
                 " "
             };
-            let sz = f
-                .size
-                .map(deleter::format_size)
-                .unwrap_or_else(|| "?".into());
-            let age = f.last_modified.map_or_else(String::new, |ts| {
-                format!(" {:>3}d", (now_secs - ts) / 86400)
-            });
-            let line = format!(" {sc} [{tag}]{rm}  {sz:>8}{age}  {}", f.path.display());
 
-            let is_even = display_i % 2 == 0;
-            let row_bg = if is_even { p.bg } else { p.surface };
-
-            let st = match f.status {
-                FolderStatus::Deleted => Style::default().fg(p.dim).bg(row_bg).crossed_out(),
-                FolderStatus::Error => Style::default().fg(p.error).bg(row_bg),
-                _ if f.risk == RiskLevel::Sensitive => Style::default().fg(p.warning).bg(row_bg),
-                _ => Style::default().fg(p.fg).bg(row_bg),
+            // Stylish deletion: show progress bar and gradually erase path
+            let is_deleting = f.status == FolderStatus::Deleting || f.status == FolderStatus::Deleted;
+            let (line, line_style) = if is_deleting {
+                let progress = app.delete_progress(ri);
+                if f.status == FolderStatus::Deleted && progress >= 1.0 {
+                    let bar = progress_bar(progress, 6);
+                    let msg = format!("   {}  Deleted  {}", bar, tag);
+                    (msg, Style::default().fg(p.dim))
+                } else if f.status == FolderStatus::Deleting || progress < 1.0 {
+                    let bar = progress_bar(progress, 6);
+                    let sz = f.size.map(deleter::format_size).unwrap_or_else(|| "?".into());
+                    let full_path = f.path.display().to_string();
+                    let visible_chars = ((1.0 - progress) * full_path.len() as f64).max(3.0) as usize;
+                    let erased_path: String = full_path.chars().take(visible_chars).collect();
+                    let age = f.last_modified.map_or_else(String::new, |ts| {
+                        format!(" {:>3}d", (now_secs - ts) / 86400)
+                    });
+                    let line = format!(" > [{tag}] {bar} {sz:>8}{age}  {erased_path}");
+                    (line, Style::default().fg(p.warning))
+                } else {
+                    let bar = progress_bar(1.0, 6);
+                    let msg = format!("   {}  Done  {}", bar, tag);
+                    (msg, Style::default().fg(p.dim))
+                }
+            } else {
+                let sz = f.size.map(deleter::format_size).unwrap_or_else(|| "?".into());
+                let age = f.last_modified.map_or_else(String::new, |ts| {
+                    format!(" {:>3}d", (now_secs - ts) / 86400)
+                });
+                let line = format!(" {sc} [{tag}]{rm}  {sz:>8}{age}  {}", f.path.display());
+                let is_even = display_i % 2 == 0;
+                let row_bg = if is_even { p.bg } else { p.surface };
+                let st = match f.status {
+                    FolderStatus::Deleted => Style::default().fg(p.dim).bg(row_bg).crossed_out(),
+                    FolderStatus::Error => Style::default().fg(p.error).bg(row_bg),
+                    _ if f.risk == RiskLevel::Sensitive => Style::default().fg(p.warning).bg(row_bg),
+                    _ => Style::default().fg(p.fg).bg(row_bg),
+                };
+                (line, st)
             };
-            ListItem::new(line).style(st)
+
+            ListItem::new(line).style(line_style)
         })
         .collect();
 
@@ -884,6 +955,12 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let mut ls = ListState::default();
     ls.select(app.list_selected);
     frame.render_stateful_widget(list_w, chunks[1], &mut ls);
+}
+
+fn progress_bar(progress: f64, width: usize) -> String {
+    let filled = (progress * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
 }
 
 fn draw_column_headers(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
@@ -924,43 +1001,52 @@ fn draw_column_headers(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalett
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(p.surface));
     frame.render_widget(
-        Paragraph::new(header)
-            .block(block)
-            .style(Style::default().bg(p.bg)),
+        Paragraph::new(header).block(block).style(Style::default().bg(p.bg)),
         area,
     );
 }
 
-// ── Settings tab ─────────────────────────────────────────────
+// ── Popup (overlay for Settings / Help) ──────────────────────
 
-fn draw_settings_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+fn draw_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+    // Dimmed backdrop
+    frame.render_widget(Clear, area);
+
+    let popup_width = area.width.clamp(40, 60);
+    let popup_height = match app.active_tab {
+        Tab::Settings => area.height.clamp(12, 16),
+        Tab::Help => area.height.clamp(18, 24),
+        _ => 12,
+    };
+    let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    match app.active_tab {
+        Tab::Settings => draw_settings_popup(frame, popup_area, app, p),
+        Tab::Help => draw_help_popup(frame, popup_area, app, p),
+        _ => {}
+    }
+}
+
+fn draw_settings_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Settings ")
+        .title_alignment(Alignment::Left)
+        .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let items: Vec<ListItem> = vec![
         format!("Theme: {}", app.theme.name()),
         format!("Dry run: {}", if app.config.dry_run { "ON" } else { "off" }),
-        format!(
-            "Exclude sensitive: {}",
-            if app.config.exclude_sensitive {
-                "ON"
-            } else {
-                "off"
-            }
-        ),
-        format!(
-            "Disable size: {}",
-            if app.config.disable_size { "ON" } else { "off" }
-        ),
-        format!(
-            "Disable age: {}",
-            if app.config.disable_age { "ON" } else { "off" }
-        ),
-        format!(
-            "Sort: {} {}",
-            app.sort_indicator(),
-            match app.sort_direction {
-                SortDirection::Asc => "↑",
-                SortDirection::Desc => "↓",
-            }
-        ),
+        format!("Exclude sensitive: {}", if app.config.exclude_sensitive { "ON" } else { "off" }),
+        format!("Disable size: {}", if app.config.disable_size { "ON" } else { "off" }),
+        format!("Disable age: {}", if app.config.disable_age { "ON" } else { "off" }),
+        format!("Sort: {} {}", app.sort_indicator(), match app.sort_direction { SortDirection::Asc => "↑", SortDirection::Desc => "↓" }),
     ]
     .into_iter()
     .enumerate()
@@ -970,10 +1056,7 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette)
         let is_even = i % 2 == 0;
         let row_bg = if is_even { p.bg } else { p.surface };
         let st = if is_cursor {
-            Style::default()
-                .fg(p.highlight_fg)
-                .bg(p.highlight_bg)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(p.highlight_fg).bg(p.highlight_bg).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.fg).bg(row_bg)
         };
@@ -981,133 +1064,107 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette)
     })
     .collect();
 
-    let list_w = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(" Settings ")
-            .title_alignment(Alignment::Left)
-            .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
-            .style(Style::default().bg(p.bg).fg(p.dim)),
-    );
-
+    let list_w = List::new(items);
     let mut ls = ListState::default();
     ls.select(Some(app.settings_cursor));
-    frame.render_stateful_widget(list_w, area, &mut ls);
+    frame.render_stateful_widget(list_w, inner, &mut ls);
 
-    let bottom = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]);
-    let chunks = bottom.split(area);
-    if chunks.len() > 1 {
-        let hint = Paragraph::new(Line::from(Span::styled(
-            " ↑/j ↓/k navigate  Enter/Space toggle  Esc/Settings back",
-            Style::default().fg(p.dim),
-        )))
-        .style(Style::default().bg(p.bg));
-        frame.render_widget(hint, chunks[1]);
-    }
+    let hint = Paragraph::new(Line::from(Span::styled(
+        " ↑/j ↓/k  Enter toggle  Esc close",
+        Style::default().fg(p.dim),
+    )))
+    .style(Style::default().bg(p.bg));
+    let hint_area = Rect::new(area.x, area.y + area.height.saturating_sub(2), area.width, 1);
+    frame.render_widget(hint, hint_area);
 }
 
-// ── Help tab ─────────────────────────────────────────────────
-
-fn draw_help_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+fn draw_help_popup(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let _ = app;
     let lines = vec![
-        Line::from(Span::styled(
-            "Help",
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled("Help", Style::default().fg(p.accent).add_modifier(Modifier::BOLD))),
         Line::from(Span::raw("")),
         Line::from(Span::styled(" Navigation", Style::default().fg(p.success))),
-        Line::from(Span::raw("  ↑/k / ↓/j     Move selection")),
-        Line::from(Span::raw("  PgUp / PgDn   Page scroll")),
-        Line::from(Span::raw("  Home/g / End/G First / last")),
-        Line::from(Span::raw("  Mouse click    Select")),
-        Line::from(Span::raw("  Scroll wheel   Navigate")),
+        Line::from(Span::raw("  ↑/k ↓/j     Move selection       PgUp/PgDn  Page")),
+        Line::from(Span::raw("  Home/g End/G  First / last")),
         Line::from(Span::raw("")),
         Line::from(Span::styled(" Actions", Style::default().fg(p.success))),
-        Line::from(Span::raw("  Enter / Space  Delete selected")),
-        Line::from(Span::raw("  Right click    Delete selected")),
-        Line::from(Span::raw("  d              Delete all (--delete-all)")),
+        Line::from(Span::raw("  Enter/Space  Delete selected")),
+        Line::from(Span::raw("  d            Delete all (--delete-all)")),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            " Sorting & Search",
-            Style::default().fg(p.success),
-        )),
-        Line::from(Span::raw("  s              Cycle sort (Size/Date/Path)")),
-        Line::from(Span::raw("  S              Reverse sort direction")),
-        Line::from(Span::raw("  /              Enter search mode")),
-        Line::from(Span::raw("")),
-        Line::from(Span::styled(" Tabs", Style::default().fg(p.success))),
-        Line::from(Span::raw("  1 / 2 / 3      Switch tab")),
-        Line::from(Span::raw("  Tab            Cycle tabs")),
-        Line::from(Span::raw("  Esc            Back to Scan tab")),
+        Line::from(Span::styled(" Sort & Search", Style::default().fg(p.success))),
+        Line::from(Span::raw("  s            Cycle sort        S  Reverse sort")),
+        Line::from(Span::raw("  /            Search")),
         Line::from(Span::raw("")),
         Line::from(Span::styled(" Other", Style::default().fg(p.success))),
-        Line::from(Span::raw("  q / Esc        Quit")),
+        Line::from(Span::raw("  2 / Tab     Settings    3 / ? / h  Help")),
+        Line::from(Span::raw("  q / Esc     Quit / close")),
         Line::from(Span::raw("")),
         Line::from(Span::styled(" CLI Options", Style::default().fg(p.success))),
-        Line::from(Span::raw("  -d <PATH>      Root directory")),
-        Line::from(Span::raw("  -b <DIR>       Blacklist")),
-        Line::from(Span::raw("  -w <DIR>       Whitelist")),
-        Line::from(Span::raw("  --dry-run      Simulate deletions")),
-        Line::from(Span::raw("  --delete-all   Auto delete")),
+        Line::from(Span::raw("  --json         JSON output    --table    Table output")),
+        Line::from(Span::raw("  --dry-run      Simulate       --delete-all  Auto del")),
+        Line::from(Span::raw("  -m / --max-depth  Limit search depth")),
         Line::from(Span::raw("  --exclude-sensitive")),
-        Line::from(Span::raw("  --json         JSON output")),
-        Line::from(Span::raw("  --table        Table output (no TUI)")),
     ];
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Help ")
+        .title_alignment(Alignment::Left)
+        .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(p.bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Help ")
-                .title_alignment(Alignment::Left)
-                .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
-                .style(Style::default().bg(p.bg).fg(p.dim)),
-        )
         .wrap(Wrap { trim: false })
         .style(Style::default().bg(p.bg));
-    frame.render_widget(para, area);
+    frame.render_widget(para, inner);
+
+    let hint = Paragraph::new(Line::from(Span::styled(
+        " Esc close",
+        Style::default().fg(p.dim),
+    )))
+    .style(Style::default().bg(p.bg));
+    let hint_area = Rect::new(area.x, area.y + area.height.saturating_sub(2), area.width, 1);
+    frame.render_widget(hint, hint_area);
 }
 
 // ── Status bar ───────────────────────────────────────────────
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
-    let left = match app.active_tab {
-        Tab::Scan => " ↑↓/j/k nav  Enter del  / search  s sort  ? help  q quit",
-        Tab::Settings => " ↑/j ↓/k nav  Enter toggle  Esc back",
-        Tab::Help => " Esc back to Scan",
+    let left = if app.popup_open {
+        match app.active_tab {
+            Tab::Settings => " ↑/j ↓/k  Enter toggle  Esc close",
+            Tab::Help => " Esc close",
+            _ => " Esc close",
+        }
+    } else {
+        match app.active_tab {
+            Tab::Scan => " ↑↓/j/k nav  Enter del  / search  s sort  2 settings  3 help  q quit",
+            _ => " Esc back",
+        }
     };
 
     let mut right_parts: Vec<Span> = Vec::new();
     if app.search_mode {
         right_parts.push(Span::styled(
             " SEARCH ",
-            Style::default()
-                .fg(p.highlight_fg)
-                .bg(p.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(p.highlight_fg).bg(p.accent).add_modifier(Modifier::BOLD),
         ));
         right_parts.push(Span::raw(" "));
     }
     if app.config.dry_run {
         right_parts.push(Span::styled(
             " DRY RUN ",
-            Style::default()
-                .fg(p.bg)
-                .bg(p.warning)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(p.bg).bg(p.warning).add_modifier(Modifier::BOLD),
         ));
         right_parts.push(Span::raw(" "));
     }
     if !app.scan_complete {
         right_parts.push(Span::styled(
             " SCANNING ",
-            Style::default()
-                .fg(p.bg)
-                .bg(p.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(p.bg).bg(p.accent).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -1194,10 +1251,7 @@ mod tests {
 
     #[test]
     fn test_delete_selected() {
-        let mut app = App::new(ScanConfig {
-            dry_run: true,
-            ..Default::default()
-        });
+        let mut app = App::new(ScanConfig { dry_run: true, ..Default::default() });
         app.folders = vec![make_folder("/tmp/t", 1024, FolderStatus::Pending)];
         app.apply_sort();
         app.delete_selected();
@@ -1285,6 +1339,7 @@ mod tests {
 
     #[test]
     fn test_format_duration() {
+        assert_eq!(App::format_duration(0.0005), "<1ms");
         assert_eq!(App::format_duration(0.05), "50ms");
         assert_eq!(App::format_duration(1.5), "1.5s");
         assert_eq!(App::format_duration(125.0), "2m 05s");

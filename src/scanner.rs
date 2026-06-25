@@ -65,11 +65,12 @@ impl Scanner {
     /// filter_entry still opens discovered targets to read their children,
     /// adding 10+ ms on large node_modules trees. Manual traversal never opens
     /// discovered targets — it detects them by name from the parent read_dir.
-    fn walk_for_targets(&self) -> Vec<FoundFolder> {
+    pub(crate) fn walk_for_targets(&self) -> Vec<FoundFolder> {
         let mut results = Vec::new();
-        let mut dirs_to_visit = vec![self.config.root_path.clone()];
+        let max_depth = self.config.max_depth;
+        let mut dirs_to_visit = vec![(self.config.root_path.clone(), 0usize)];
 
-        while let Some(dir) = dirs_to_visit.pop() {
+        while let Some((dir, depth)) = dirs_to_visit.pop() {
             if self.stop_flag.load(Ordering::SeqCst) {
                 break;
             }
@@ -109,6 +110,11 @@ impl Scanner {
                 }
 
                 let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let entry_depth = depth + 1;
+
+                if max_depth.is_some_and(|md| entry_depth > md) {
+                    continue;
+                }
 
                 if let Some(target) = self.is_target(dir_name) {
                     let (risk_level, risk_reason) = risk::analyze(&path);
@@ -116,23 +122,26 @@ impl Scanner {
                         continue;
                     }
 
-                    if let Some(ref prog) = self.progress {
-                        let mut p = prog.lock().unwrap();
-                        p.folders_found += 1;
-                    }
-
-                    results.push(FoundFolder {
-                        path,
+                    let folder = FoundFolder {
+                        path: path.clone(),
                         target,
                         size: None,
                         last_modified: None,
                         status: FolderStatus::Pending,
                         risk: risk_level,
                         risk_reason,
-                    });
+                    };
+
+                    if let Some(ref prog) = self.progress {
+                        let mut p = prog.lock().unwrap();
+                        p.folders_found += 1;
+                        p.pending_folders.push(folder.clone());
+                    }
+
+                    results.push(folder);
                 } else {
                     // Not a target, recurse deeper
-                    dirs_to_visit.push(path);
+                    dirs_to_visit.push((path, entry_depth));
                 }
             }
         }
@@ -140,7 +149,7 @@ impl Scanner {
     }
 
     /// Phase 2: compute sizes (+ ages) for all discovered targets in parallel.
-    fn compute_stats_parallel(&self, folders: &mut Vec<FoundFolder>) {
+    pub(crate) fn compute_stats_parallel(&self, folders: &mut Vec<FoundFolder>) {
         let progress = self.progress.clone();
         let disable_size = self.config.disable_size;
         let disable_age = self.config.disable_age;
@@ -387,6 +396,80 @@ mod tests {
         let scanner = Scanner::new(config);
         let results = scanner.scan();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_max_depth_zero_finds_nothing_beyond_root() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("project/node_modules")).unwrap();
+        fs::create_dir_all(dir.path().join("project/src")).unwrap();
+        // depth 0 = only root, so nothing at depth 1
+        let config = ScanConfig {
+            root_path: dir.path().join("project"),
+            targets: vec![TargetKind::NodeModules],
+            max_depth: Some(0),
+            ..Default::default()
+        };
+        let scanner = Scanner::new(config);
+        let results = scanner.scan();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_max_depth_1_finds_direct_targets() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("project/node_modules")).unwrap();
+        fs::create_dir_all(dir.path().join("project/sub/node_modules")).unwrap();
+        let config = ScanConfig {
+            root_path: dir.path().join("project"),
+            targets: vec![TargetKind::NodeModules],
+            max_depth: Some(1),
+            ..Default::default()
+        };
+        let scanner = Scanner::new(config);
+        let results = scanner.scan();
+        // Should only find project/node_modules (depth 1), not project/sub/node_modules (depth 2)
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.ends_with("project/node_modules"));
+    }
+
+    #[test]
+    fn test_max_depth_2_finds_nested_targets() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("a/node_modules")).unwrap();
+        fs::create_dir_all(dir.path().join("a/b/node_modules")).unwrap();
+        fs::create_dir_all(dir.path().join("a/b/c/node_modules")).unwrap();
+        let config = ScanConfig {
+            root_path: dir.path().join("a"),
+            targets: vec![TargetKind::NodeModules],
+            max_depth: Some(2),
+            ..Default::default()
+        };
+        let scanner = Scanner::new(config);
+        let results = scanner.scan();
+        // Should find a/node_modules (depth 1) and a/b/node_modules (depth 2),
+        // but not a/b/c/node_modules (depth 3)
+        assert_eq!(results.len(), 2);
+        let paths: Vec<_> = results.iter().map(|f| f.path.display().to_string()).collect();
+        assert!(paths.iter().any(|p| p.ends_with("a/node_modules")));
+        assert!(paths.iter().any(|p| p.ends_with("a/b/node_modules")));
+    }
+
+    #[test]
+    fn test_max_depth_none_finds_all() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("a/node_modules")).unwrap();
+        fs::create_dir_all(dir.path().join("a/b/node_modules")).unwrap();
+        fs::create_dir_all(dir.path().join("a/b/c/node_modules")).unwrap();
+        let config = ScanConfig {
+            root_path: dir.path().join("a"),
+            targets: vec![TargetKind::NodeModules],
+            max_depth: None,
+            ..Default::default()
+        };
+        let scanner = Scanner::new(config);
+        let results = scanner.scan();
+        assert_eq!(results.len(), 3);
     }
 
     #[test]

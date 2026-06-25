@@ -9,6 +9,8 @@ pub struct ScanProgress {
     pub total_size_reclaimable: u64,
     pub dirs_visited: u64,
     pub current_path: String,
+    /// Incrementally discovered folders — TUI drains these each frame.
+    pub pending_folders: Vec<FoundFolder>,
 }
 
 impl ScanProgress {
@@ -18,6 +20,7 @@ impl ScanProgress {
             total_size_reclaimable: 0,
             dirs_visited: 0,
             current_path: String::new(),
+            pending_folders: Vec::new(),
         }))
     }
 }
@@ -97,6 +100,7 @@ pub struct ScanConfig {
     pub exclude_sensitive: bool,
     pub delete_all: bool,
     pub yes: bool,
+    pub max_depth: Option<usize>,
 }
 
 impl Default for ScanConfig {
@@ -113,6 +117,7 @@ impl Default for ScanConfig {
             exclude_sensitive: false,
             delete_all: false,
             yes: false,
+            max_depth: None,
         }
     }
 }
