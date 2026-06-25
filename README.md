@@ -4,6 +4,16 @@
 
 A Rust reimplementation of [npkill](https://github.com/voidcosmos/npkill) with added support for `.next` directories, mouse interactions, real-time search, sorting, and a polished TUI.
 
+Created by [David Pere](https://kierkegaard.space) — [@davidpereishim](https://x.com/davidpereishim)
+
+## Quick Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.sh | bash
+```
+
+This downloads the latest binary for your platform, installs it to `~/.local/bin`, and adds it to your `PATH`.
+
 ## Features
 
 - **Dual target scanning** — finds both `node_modules` and `.next` directories
@@ -19,6 +29,14 @@ A Rust reimplementation of [npkill](https://github.com/voidcosmos/npkill) with a
 - **JSON output** — machine-readable output (use `--json`)
 
 ## Installation
+
+### Quick (pre-built binary)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/David-glitc/npkill-rs/main/install.sh | bash
+```
+
+Supports Linux (x86_64, aarch64) and macOS (x86_64, arm64).
 
 ### From source
 
@@ -86,6 +104,12 @@ cargo build --release
 ```bash
 cargo test
 ```
+
+## Author
+
+**David Pere**
+- Website: [kierkegaard.space](https://kierkegaard.space)
+- X / Twitter: [@davidpereishim](https://x.com/davidpereishim)
 
 ## License
 

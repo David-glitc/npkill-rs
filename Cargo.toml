@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Fast interactive tool to find and delete node_modules and .next directories"
 edition = "2021"
 license = "MIT"
+authors = ["David Pere"]
+homepage = "https://kierkegaard.space"
 repository = "https://github.com/David-glitc/npkill-rs"
 
 [[bin]]
