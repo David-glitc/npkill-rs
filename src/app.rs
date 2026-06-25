@@ -7,10 +7,12 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::{Frame, Terminal};
 
 use crate::deleter::{self, DeleteResult};
@@ -31,33 +33,19 @@ pub struct App {
     pub scan_start: Option<Instant>,
     pub status_message: String,
     pub should_quit: bool,
-
-    // Tabs
     pub active_tab: Tab,
-
-    // Search
     pub search_mode: bool,
     pub search_query: String,
-
-    // Sort
     pub sort_field: SortField,
     pub sort_direction: SortDirection,
-
-    // Animations
     pub frame_count: u64,
     pub delete_animations: Vec<DeleteAnimation>,
-
-    // ETA / progress
     pub total_dirs_visited: u64,
     pub eta_seconds: Option<f64>,
     pub scan_progress: f64,
     pub scan_complete: bool,
     pub current_scan_path: String,
-
-    // Theme
     pub theme: Theme,
-
-    // Settings cursor
     pub settings_cursor: usize,
 }
 
@@ -105,6 +93,7 @@ impl App {
         self.stats.total_found = self.folders.len();
         self.stats.total_size_reclaimable = deleter::get_total_size(&self.folders);
         self.scan_complete = true;
+        self.scan_progress = 1.0;
         if let Some(start) = self.scan_start {
             self.stats.scan_duration_secs = start.elapsed().as_secs_f64();
         }
@@ -294,13 +283,6 @@ impl App {
         });
     }
 
-    pub fn scan_progress_bar(&self) -> String {
-        let pct = (self.scan_progress * 100.0).min(100.0) as u8;
-        let filled = (pct as usize).saturating_div(10);
-        let empty = 10usize.saturating_sub(filled);
-        format!("[{}{}] {}%", "█".repeat(filled), "░".repeat(empty), pct)
-    }
-
     pub fn spinner_char(&self) -> char {
         SPINNER_CHARS[(self.frame_count as usize) % SPINNER_CHARS.len()]
     }
@@ -316,6 +298,18 @@ impl App {
             SortField::Path => "Path",
         };
         format!("{arrow} {field}")
+    }
+
+    fn format_duration(secs: f64) -> String {
+        if secs < 1.0 {
+            format!("{:.0}ms", secs * 1000.0)
+        } else if secs < 60.0 {
+            format!("{:.1}s", secs)
+        } else {
+            let m = (secs as u64) / 60;
+            let s = (secs as u64) % 60;
+            format!("{}m {:02}s", m, s)
+        }
     }
 }
 
@@ -353,9 +347,14 @@ fn run(
             a.update_animations();
             if let Ok(p) = progress.lock() {
                 a.current_scan_path = p.current_path.clone();
+                a.total_dirs_visited = p.dirs_visited;
                 a.stats.total_found = a.stats.total_found.max(p.folders_found);
                 a.stats.total_size_reclaimable =
                     a.stats.total_size_reclaimable.max(p.total_size_reclaimable);
+                if !a.scan_complete && p.dirs_visited > 0 {
+                    let progress = (p.dirs_visited as f64 * 0.01).min(0.99);
+                    a.scan_progress = progress;
+                }
             }
         }
 
@@ -402,7 +401,6 @@ fn run(
                     Tab::Scan => handle_scan_key(&mut a, key.code),
                 }
 
-                // Force immediate render on input
                 last_render = Instant::now()
                     .checked_sub(min_frame_time)
                     .unwrap_or(Instant::now());
@@ -523,7 +521,6 @@ fn handle_settings_key(a: &mut App, code: KeyCode) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => match a.settings_cursor {
             0 => {
-                // Theme cycle
                 let themes = Theme::all();
                 let idx = themes.iter().position(|t| *t == a.theme).unwrap_or(0);
                 a.theme = themes[(idx + 1) % themes.len()];
@@ -550,7 +547,6 @@ fn handle_settings_key(a: &mut App, code: KeyCode) {
 fn ui(frame: &mut Frame, app: &mut Arc<Mutex<App>>) {
     let a = app.lock().unwrap();
     let p = a.palette();
-    let _bg = Style::default().bg(p.bg).fg(p.fg);
 
     let vert = Layout::vertical([
         Constraint::Length(1),
@@ -588,8 +584,7 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
         spans.push(Span::raw(" "));
     }
     let line = Line::from(spans);
-    let para = Paragraph::new(line).style(Style::default().bg(p.bg));
-    frame.render_widget(para, area);
+    frame.render_widget(Paragraph::new(line).style(Style::default().bg(p.bg)), area);
 }
 
 // ── Content ──────────────────────────────────────────────────
@@ -605,134 +600,175 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
 // ── Scan tab ─────────────────────────────────────────────────
 
 fn draw_scan_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+    let gap = 1;
+    let total = area.height;
+    let header_h = 9.min(total.saturating_sub(1));
     let sections = Layout::vertical([
-        Constraint::Length(8), // header box (bordered)
-        Constraint::Min(0),    // folder list box (bordered)
+        Constraint::Length(header_h),
+        Constraint::Length(gap),
+        Constraint::Min(0),
     ]);
     let chunks = sections.split(area);
-    if chunks.len() < 2 {
+
+    if chunks.len() < 3 {
         return;
     }
 
     draw_scan_header_box(frame, chunks[0], app, p);
-    draw_folder_box(frame, chunks[1], app, p);
+    draw_folder_box(frame, chunks[2], app, p);
 }
 
 fn draw_scan_header_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Scan Summary ")
+        .border_type(BorderType::Rounded)
+        .title(format!(" npkill-rs v{} ", env!("CARGO_PKG_VERSION")))
+        .title_alignment(Alignment::Left)
         .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(p.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height < 5 {
+    if inner.height < 6 {
         return;
     }
 
     let rows = Layout::vertical([
         Constraint::Length(1), // title + sort + search
-        Constraint::Length(1), // stats row 1
-        Constraint::Length(1), // stats row 2 (time + reclaimable)
+        Constraint::Length(1), // stats row 1 (found/deleted/errors)
+        Constraint::Length(1), // stats row 2 (reclaimable + time)
         Constraint::Length(1), // scan path
-        Constraint::Length(1), // progress bar
+        Constraint::Length(1), // progress row
+        Constraint::Min(0),    // spacer
     ]);
     let chunks = rows.split(inner);
 
-    // Row 0: app title + sort indicator + search hint
-    let title = format!(" npkill-rs v{}", env!("CARGO_PKG_VERSION"));
+    // Row 0: app title line with sort indicator and search hint
     let sort_text = app.sort_indicator();
     let search_hint = if app.search_mode {
-        format!("  / {} _", app.search_query)
+        format!("  / {} ▌", app.search_query)
     } else {
         "  / search".to_string()
     };
-
     let title_line = Line::from(vec![
         Span::styled(
-            &title,
+            " npkill-rs ",
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled(&sort_text, Style::default().fg(p.success)),
+        Span::styled("|", Style::default().fg(p.dim)),
+        Span::raw(" "),
+        Span::styled(
+            &sort_text,
+            Style::default().fg(p.success).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(&search_hint, Style::default().fg(p.dim)),
     ]);
     frame.render_widget(Paragraph::new(title_line), chunks[0]);
 
     // Row 1: stats — found / deleted / errors
-    let stats_line = format!(
-        " Found: {}   Deleted: {}   Errors: {}",
-        app.stats.total_found, app.stats.total_deleted, app.stats.total_errors,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            &stats_line,
-            Style::default().fg(p.fg),
-        ))),
-        chunks[1],
-    );
+    let found_str = format!("{}", app.stats.total_found);
+    let deleted_str = format!("{}", app.stats.total_deleted);
+    let errors_str = format!("{}", app.stats.total_errors);
+    let reclaimable_str = deleter::format_size(app.stats.total_size_reclaimable);
+    let freed_str = deleter::format_size(app.stats.total_size_freed);
+
+    let stats1 = Line::from(vec![
+        Span::styled(" Found:  ", Style::default().fg(p.dim)),
+        Span::styled(
+            &found_str,
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("│", Style::default().fg(p.surface)),
+        Span::raw("  "),
+        Span::styled("Deleted: ", Style::default().fg(p.dim)),
+        Span::styled(&deleted_str, Style::default().fg(p.success)),
+        Span::raw("  "),
+        Span::styled("│", Style::default().fg(p.surface)),
+        Span::raw("  "),
+        Span::styled("Errors: ", Style::default().fg(p.dim)),
+        Span::styled(&errors_str, Style::default().fg(p.error)),
+    ]);
+    frame.render_widget(Paragraph::new(stats1), chunks[1]);
 
     // Row 2: reclaimable + scan time
     let time_str = if app.scan_complete {
-        let s = app.stats.scan_duration_secs;
-        format!("{:.2}s", s)
-    } else if app.stats.total_found > 0 {
-        "scanning...".to_string()
+        App::format_duration(app.stats.scan_duration_secs)
     } else {
-        "--".to_string()
+        "scanning...".to_string()
     };
-    let time_line = format!(
-        " Reclaimable: {}   Scan time: {}",
-        deleter::format_size(app.stats.total_size_reclaimable),
-        time_str,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            &time_line,
-            Style::default().fg(p.fg),
-        ))),
-        chunks[2],
-    );
+    let stats2 = Line::from(vec![
+        Span::styled(" Reclaimable: ", Style::default().fg(p.dim)),
+        Span::styled(
+            &reclaimable_str,
+            Style::default().fg(p.warning).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("│", Style::default().fg(p.surface)),
+        Span::raw("  "),
+        Span::styled("Scan time: ", Style::default().fg(p.dim)),
+        Span::styled(&time_str, Style::default().fg(p.accent)),
+        Span::raw("  "),
+        Span::styled("│", Style::default().fg(p.surface)),
+        Span::raw("  "),
+        Span::styled("Freed: ", Style::default().fg(p.dim)),
+        Span::styled(&freed_str, Style::default().fg(p.success)),
+    ]);
+    frame.render_widget(Paragraph::new(stats2), chunks[2]);
 
     // Row 3: current scan path
     let scan_path = if !app.current_scan_path.is_empty() {
-        format!(" Path: {}", app.current_scan_path)
+        &app.current_scan_path
     } else if !app.scan_complete {
-        " Path: scanning...".to_string()
+        "scanning..."
     } else {
-        String::new()
+        ""
     };
     let path_style = if !app.scan_complete {
         Style::default().fg(p.warning)
     } else {
         Style::default().fg(p.success)
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(&scan_path, path_style))),
-        chunks[3],
-    );
+    let path_line = Line::from(vec![
+        Span::styled(" Path: ", Style::default().fg(p.dim)),
+        Span::styled(scan_path, path_style),
+    ]);
+    frame.render_widget(Paragraph::new(path_line), chunks[3]);
 
-    // Row 4: progress bar (only during scan)
+    // Row 4: progress bar
     if !app.scan_complete {
-        let spinner = if !app.folders.is_empty() {
-            format!("{} ", app.spinner_char())
-        } else {
-            String::new()
-        };
-        let eta_str = app
-            .eta_seconds
-            .filter(|&e| e > 0.0)
-            .map_or_else(String::new, |eta| format!(" ETA {:.0}s", eta));
-        let progress_str = app.scan_progress_bar();
-        let status = format!(" {}{}{}", spinner, progress_str, eta_str);
+        let spinner = app.spinner_char();
+        let dirs = app.total_dirs_visited;
+        let found = app.stats.total_found;
+        let progress_str = format!(" {}  dirs: {}  found: {}", spinner, dirs, found);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                &status,
+                &progress_str,
                 Style::default().fg(p.accent),
             ))),
             chunks[4],
         );
+    } else {
+        let gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .borders(Borders::NONE)
+                    .style(Style::default().bg(p.bg)),
+            )
+            .gauge_style(
+                Style::default()
+                    .fg(p.success)
+                    .bg(p.surface)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .percent(100)
+            .label(format!(
+                " ✓ {} — {} folders, {}",
+                App::format_duration(app.stats.scan_duration_secs),
+                app.folders.len(),
+                deleter::format_size(app.stats.total_size_reclaimable),
+            ));
+        frame.render_widget(gauge, chunks[4]);
     }
 }
 
@@ -749,18 +785,24 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
+        .title_alignment(Alignment::Left)
         .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(p.bg));
 
     if app.filtered_indices.is_empty() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         let msg = if app.search_query.is_empty() {
-            " No folders found. Scanning..."
+            if app.scan_complete {
+                " No folders found."
+            } else {
+                " Scanning..."
+            }
         } else {
             " No folders match your search."
         };
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(p.dim)))),
             inner,
@@ -771,7 +813,6 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Inner layout: column header + list
     let sections = Layout::vertical([
         Constraint::Length(1), // column header
         Constraint::Min(0),    // folder list
@@ -791,7 +832,8 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
     let items: Vec<ListItem> = app
         .filtered_indices
         .iter()
-        .map(|&ri| {
+        .enumerate()
+        .map(|(display_i, &ri)| {
             let f = &app.folders[ri];
             let tag = match f.target {
                 crate::types::TargetKind::NodeModules => "NM",
@@ -817,11 +859,14 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
             });
             let line = format!(" {sc} [{tag}]{rm}  {sz:>8}{age}  {}", f.path.display());
 
+            let is_even = display_i % 2 == 0;
+            let row_bg = if is_even { p.bg } else { p.surface };
+
             let st = match f.status {
-                FolderStatus::Deleted => Style::default().fg(p.dim).crossed_out(),
-                FolderStatus::Error => Style::default().fg(p.error),
-                _ if f.risk == RiskLevel::Sensitive => Style::default().fg(p.warning),
-                _ => Style::default().fg(p.fg),
+                FolderStatus::Deleted => Style::default().fg(p.dim).bg(row_bg).crossed_out(),
+                FolderStatus::Error => Style::default().fg(p.error).bg(row_bg),
+                _ if f.risk == RiskLevel::Sensitive => Style::default().fg(p.warning).bg(row_bg),
+                _ => Style::default().fg(p.fg).bg(row_bg),
             };
             ListItem::new(line).style(st)
         })
@@ -838,36 +883,45 @@ fn draw_folder_box(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
 
     let mut ls = ListState::default();
     ls.select(app.list_selected);
-    // List handles scroll automatically based on selected item
     frame.render_stateful_widget(list_w, chunks[1], &mut ls);
 }
 
-fn draw_column_headers(frame: &mut Frame, area: Rect, _app: &App, p: &ColorPalette) {
+fn draw_column_headers(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
+    let sort_field = app.sort_field;
+    let col_status = Span::styled(" S  ", Style::default().fg(p.dim));
+    let col_tag = Span::styled("[Tag]", Style::default().fg(p.dim));
+
+    let (size_style, date_style, path_style) = match sort_field {
+        SortField::Size => (
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.dim),
+            Style::default().fg(p.dim),
+        ),
+        SortField::Date => (
+            Style::default().fg(p.dim),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.dim),
+        ),
+        SortField::Path => (
+            Style::default().fg(p.dim),
+            Style::default().fg(p.dim),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+    };
+
     let header = Line::from(vec![
-        Span::styled(
-            " S [Tag]",
-            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
-        ),
+        col_status,
+        col_tag,
         Span::raw(" "),
-        Span::styled(
-            "Size",
-            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("     "),
-        Span::styled(
-            "Age",
-            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Path",
-            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("Size", size_style),
+        Span::raw("    "),
+        Span::styled(" Age ", date_style),
+        Span::styled(" Path", path_style),
     ]);
     let block = Block::default()
         .style(Style::default().bg(p.bg))
         .borders(Borders::TOP)
-        .border_type(ratatui::widgets::BorderType::Plain)
+        .border_type(BorderType::Plain)
         .border_style(Style::default().fg(p.surface));
     frame.render_widget(
         Paragraph::new(header)
@@ -913,13 +967,15 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette)
     .map(|(i, text)| {
         let is_cursor = i == app.settings_cursor;
         let prefix = if is_cursor { "▸ " } else { "  " };
+        let is_even = i % 2 == 0;
+        let row_bg = if is_even { p.bg } else { p.surface };
         let st = if is_cursor {
             Style::default()
                 .fg(p.highlight_fg)
                 .bg(p.highlight_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(p.fg).bg(p.bg)
+            Style::default().fg(p.fg).bg(row_bg)
         };
         ListItem::new(format!("{}{}", prefix, text)).style(st)
     })
@@ -928,7 +984,10 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette)
     let list_w = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .title(" Settings ")
+            .title_alignment(Alignment::Left)
+            .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
             .style(Style::default().bg(p.bg).fg(p.dim)),
     );
 
@@ -936,13 +995,12 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette)
     ls.select(Some(app.settings_cursor));
     frame.render_stateful_widget(list_w, area, &mut ls);
 
-    // Draw hint text below settings
     let bottom = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]);
     let chunks = bottom.split(area);
     if chunks.len() > 1 {
         let hint = Paragraph::new(Line::from(Span::styled(
             " ↑/j ↓/k navigate  Enter/Space toggle  Esc/Settings back",
-            Style::default().fg(p.dim).bg(p.bg),
+            Style::default().fg(p.dim),
         )))
         .style(Style::default().bg(p.bg));
         frame.render_widget(hint, chunks[1]);
@@ -952,74 +1010,60 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette)
 // ── Help tab ─────────────────────────────────────────────────
 
 fn draw_help_tab(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
-    // Use app to get current keybindings context
     let _ = app;
     let lines = vec![
         Line::from(Span::styled(
             "Help",
-            Style::default()
-                .fg(p.accent)
-                .add_modifier(Modifier::BOLD)
-                .bg(p.bg),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            " Navigation",
-            Style::default().fg(p.success).bg(p.bg),
-        )),
+        Line::from(Span::styled(" Navigation", Style::default().fg(p.success))),
         Line::from(Span::raw("  ↑/k / ↓/j     Move selection")),
         Line::from(Span::raw("  PgUp / PgDn   Page scroll")),
         Line::from(Span::raw("  Home/g / End/G First / last")),
         Line::from(Span::raw("  Mouse click    Select")),
         Line::from(Span::raw("  Scroll wheel   Navigate")),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            " Actions",
-            Style::default().fg(p.success).bg(p.bg),
-        )),
+        Line::from(Span::styled(" Actions", Style::default().fg(p.success))),
         Line::from(Span::raw("  Enter / Space  Delete selected")),
         Line::from(Span::raw("  Right click    Delete selected")),
         Line::from(Span::raw("  d              Delete all (--delete-all)")),
         Line::from(Span::raw("")),
         Line::from(Span::styled(
             " Sorting & Search",
-            Style::default().fg(p.success).bg(p.bg),
+            Style::default().fg(p.success),
         )),
         Line::from(Span::raw("  s              Cycle sort (Size/Date/Path)")),
         Line::from(Span::raw("  S              Reverse sort direction")),
         Line::from(Span::raw("  /              Enter search mode")),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            " Tabs",
-            Style::default().fg(p.success).bg(p.bg),
-        )),
+        Line::from(Span::styled(" Tabs", Style::default().fg(p.success))),
         Line::from(Span::raw("  1 / 2 / 3      Switch tab")),
         Line::from(Span::raw("  Tab            Cycle tabs")),
         Line::from(Span::raw("  Esc            Back to Scan tab")),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            " Other",
-            Style::default().fg(p.success).bg(p.bg),
-        )),
+        Line::from(Span::styled(" Other", Style::default().fg(p.success))),
         Line::from(Span::raw("  q / Esc        Quit")),
         Line::from(Span::raw("")),
-        Line::from(Span::styled(
-            " CLI Options",
-            Style::default().fg(p.success).bg(p.bg),
-        )),
+        Line::from(Span::styled(" CLI Options", Style::default().fg(p.success))),
         Line::from(Span::raw("  -d <PATH>      Root directory")),
         Line::from(Span::raw("  -b <DIR>       Blacklist")),
         Line::from(Span::raw("  -w <DIR>       Whitelist")),
         Line::from(Span::raw("  --dry-run      Simulate deletions")),
         Line::from(Span::raw("  --delete-all   Auto delete")),
         Line::from(Span::raw("  --exclude-sensitive")),
+        Line::from(Span::raw("  --json         JSON output")),
+        Line::from(Span::raw("  --table        Table output (no TUI)")),
     ];
 
     let para = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Help ")
+                .title_alignment(Alignment::Left)
+                .title_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
                 .style(Style::default().bg(p.bg).fg(p.dim)),
         )
         .wrap(Wrap { trim: false })
@@ -1036,26 +1080,40 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App, p: &ColorPalette) {
         Tab::Help => " Esc back to Scan",
     };
 
-    let mut right = String::new();
+    let mut right_parts: Vec<Span> = Vec::new();
+    if app.search_mode {
+        right_parts.push(Span::styled(
+            " SEARCH ",
+            Style::default()
+                .fg(p.highlight_fg)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right_parts.push(Span::raw(" "));
+    }
     if app.config.dry_run {
-        right.push_str(" DRY RUN ");
+        right_parts.push(Span::styled(
+            " DRY RUN ",
+            Style::default()
+                .fg(p.bg)
+                .bg(p.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right_parts.push(Span::raw(" "));
     }
     if !app.scan_complete {
-        right.push_str(" SCANNING ");
+        right_parts.push(Span::styled(
+            " SCANNING ",
+            Style::default()
+                .fg(p.bg)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
 
-    let left_spans = Span::styled(left, Style::default().fg(p.dim).bg(p.bg));
-    let right_spans = Span::styled(
-        &right,
-        Style::default()
-            .fg(p.warning)
-            .bg(p.bg)
-            .add_modifier(Modifier::BOLD),
-    );
-
     let block = Block::default()
-        .title(Line::from(left_spans))
-        .title_bottom(Line::from(right_spans))
+        .title(Line::from(Span::styled(left, Style::default().fg(p.dim))))
+        .title_bottom(Line::from(right_parts))
         .style(Style::default().bg(p.bg));
     frame.render_widget(block, area);
 }
@@ -1194,7 +1252,6 @@ mod tests {
         let mut app = setup_app();
         app.active_tab = Tab::Settings;
         assert_eq!(app.theme, Theme::Catppuccino);
-        // Toggle theme via Enter on cursor 0
         app.settings_cursor = 0;
         handle_settings_key(&mut app, KeyCode::Enter);
         assert_eq!(app.theme, Theme::Nord);
@@ -1211,16 +1268,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_progress_bar() {
-        let mut app = setup_app();
-        app.scan_progress = 0.5;
-        let bar = app.scan_progress_bar();
-        assert!(bar.contains('█'));
-        assert!(bar.contains('░'));
-        assert!(bar.contains("50%"));
-    }
-
-    #[test]
     fn test_spinner_char() {
         let mut app = setup_app();
         app.frame_count = 0;
@@ -1234,5 +1281,12 @@ mod tests {
         let ind = app.sort_indicator();
         assert!(ind.contains("Size"));
         assert!(ind.contains('▼'));
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(App::format_duration(0.05), "50ms");
+        assert_eq!(App::format_duration(1.5), "1.5s");
+        assert_eq!(App::format_duration(125.0), "2m 05s");
     }
 }

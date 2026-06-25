@@ -47,6 +47,9 @@ pub struct CliArgs {
 
     #[arg(long)]
     pub json: bool,
+
+    #[arg(long)]
+    pub table: bool,
 }
 
 impl From<CliArgs> for ScanConfig {
@@ -101,6 +104,7 @@ mod tests {
             delete_all: false,
             yes: false,
             json: false,
+            table: false,
         };
         let config: ScanConfig = args.into();
         assert_eq!(config.targets.len(), 2);
@@ -123,6 +127,7 @@ mod tests {
             delete_all: false,
             yes: false,
             json: false,
+            table: false,
         };
         let config: ScanConfig = args.into();
         assert_eq!(config.blacklist, vec!["/tmp"]);
